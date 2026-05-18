@@ -1,0 +1,31 @@
+name: Automated_Stock_PCA_Pipeline
+
+on:
+  schedule:
+    # 💡 台北時間每日下午 16:30 執行 (國際標準時 UTC 08:30)
+    - cron: '30 8 * * *'
+  workflow_dispatch: # 支援手動點選「Run workflow」立即執行
+
+jobs:
+  run-pca-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 複製 GitHub 倉庫程式碼
+        uses: actions/checkout@v3
+
+      - name: 2. 初始化 Python 3.10 環境
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 3. 安裝 Python 依賴庫
+        run: |
+          pip install pandas numpy scikit-learn gspread oauth2client requests matplotlib google-api-python-client google-auth
+
+      - name: 4. 執行 PCA 預測引擎並與雲端 Google Sheets 聯動
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: |
+          python PCA_TWIIV1.0.py
