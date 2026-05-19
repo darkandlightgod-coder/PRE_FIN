@@ -88,7 +88,7 @@ CONFIG = {
 # =====================================================================
 def get_google_clients():
     print("🔐 正在初始化 Google 雲端授權...")
-    creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or \
+    creds_json = os.environ.get("GSPREAD_CREDENTIALS") or \
                  os.environ.get("GOOGLE_CREDENTIALS") or \
                  os.environ.get("GCP_CREDENTIALS")
     
@@ -118,7 +118,7 @@ def get_google_clients():
         print("解決：請在 workflow (.yml) 檔案中，找到執行這個腳本的地方，確保加入了 env 區塊：")
         print("      - name: 執行 Python 腳本")
         print("        env:")
-        print("          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}")
+        print("          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}")
         print("          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}")
         print("        run: python pca_master_exceed.py")
         print("👉 為了避免「假成功」錯覺，程式將在此強制中斷 (Exit 1)。\n")
