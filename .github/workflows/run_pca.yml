@@ -1,6 +1,5 @@
 name: Run PCA Prediction Pipeline
 
-# 觸發條件設定
 on:
   schedule:
     # 台北時間週一至週五，每天晚上 18:30 自動執行 (對應 UTC 時間 10:30)
@@ -9,7 +8,6 @@ on:
   # 支援在 GitHub 網頁一鍵手動執行
   workflow_dispatch:
 
-# 賦予 Action 寫入權限，以便將更新後的 CSV 與圖表 Push 回倉庫
 permissions:
   contents: write
 
@@ -22,29 +20,49 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. 設定 Python 環境 (移除 cache 避免找不到 requirements.txt 報錯)
+      # 2. 設定 Python 環境 (無快取乾淨安裝)
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # 3. 安裝所有量化與機器學習必要套件
+      # 3. 安裝必要套件
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 playwright
 
-      # 4. 安裝 Playwright 瀏覽器核心及 Linux 系統依賴檔 (確保 Chromium 順利運行)
+      # 4. 安裝 Playwright 瀏覽器核心
       - name: Install Playwright Chromium with Deps
         run: |
           playwright install --with-deps chromium
 
-      # 5. 依序執行預測流水線中的 4 個 Python 腳本
+      # 5. 診斷與路徑自癒執行 (自動尋找腳本所在資料夾並切換執行)
       - name: Execute PCA Prediction Pipeline
         env:
-          # 將您的 GitHub Secrets 串接至環境變數 (若無設定，腳本會自動使用本地情緒引擎)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
+          echo "🔍 正在搜尋腳本所在的目標資料夾..."
+          TARGET_FILE="specific_web_index_and_all_number_data_grab.py"
+          SCRIPT_PATH=$(find . -name "$TARGET_FILE" | head -n 1)
+          
+          if [ -z "$SCRIPT_PATH" ]; then
+            echo "❌ [ERROR] 在 GitHub 倉庫中找不到關鍵腳本: $TARGET_FILE"
+            echo "=========================================================="
+            echo "💡 排除障礙指南："
+            echo "1. 請檢查您的本地端，是否尚未將這些 .py 檔案 Commit 並 Push 到 GitHub 上。"
+            echo "2. 請確認您目前執行的 GitHub Action 分支是否與您 Push 檔案的分支一致。"
+            echo "=========================================================="
+            echo "📁 目前 GitHub 虛擬機中的檔案結構清單如下："
+            find . -maxdepth 4 -not -path '*/.*' -not -path './node_modules*'
+            exit 1
+          fi
+          
+          # 取得腳本所在的資料夾路徑
+          SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+          echo "🎯 成功尋找到腳本目錄：$SCRIPT_DIR"
+          cd "$SCRIPT_DIR"
+          
           echo "🚀 步驟 1/4: 開始抓取台股選擇權與三大法人數據..."
           python specific_web_index_and_all_number_data_grab.py
           
