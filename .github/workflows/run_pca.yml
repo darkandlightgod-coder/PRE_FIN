@@ -26,22 +26,23 @@ jobs:
         with:
           python-version: '3.10'
 
-      # 3. 安裝必要套件
+      # 3. 安裝必要套件 (包含 Google 雲端 API 系列套件)
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 playwright
+          pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 playwright gspread google-auth google-api-python-client
 
-      # 4. 安裝 Playwright 瀏覽器核心
+      # 4. 安裝 Playwright 瀏覽器核心 (用於爬蟲)
       - name: Install Playwright Chromium with Deps
         run: |
           playwright install --with-deps chromium
 
-      # 5. 執行自動化排程（加入診斷與即時輸出防卡死機制）
+      # 5. 執行自動化預測流水線 (串接 GitHub Secrets 變數)
       - name: Execute PCA Prediction Pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # 💡 關鍵設定 1：禁用 Python 輸出緩衝！讓所有 print() 即時在網頁上印出，不再有視覺卡死的假象
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
           PYTHONUNBUFFERED: "1"
         run: |
           echo "🔍 正在搜尋腳本所在的目標資料夾..."
@@ -59,30 +60,26 @@ jobs:
           echo "🎯 成功尋找到腳本目錄：$SCRIPT_DIR"
           cd "$SCRIPT_DIR"
           
-          # 💡 關鍵設定 2：在執行 Python 腳本時加上 '< /dev/null'
-          # 如果程式試圖呼叫 input() 或是 Google 互動式登入，會因為沒有輸入源而立即報錯（不會卡住等 6 小時）
-          # 這能保護您的 GitHub Actions 免費執行額度不被浪費！
-          
           echo "🚀 步驟 1/4: 開始抓取台股選擇權與三大法人數據..."
           python specific_web_index_and_all_number_data_grab.py < /dev/null
           
           echo "🚀 步驟 2/4: 開始採集焦點財經新聞並進行 AI 情緒分析解構..."
           python web_grab_and_language_AI_score_for_PCA.py < /dev/null
           
-          echo "🚀 步驟 3/4: 開始抓取全球多維度關鍵市場特徵指標 (美股、大宗、匯率、加密貨幣)..."
+          echo "🚀 步驟 3/4: 開始抓取全球多維度關鍵市場特徵指標..."
           python GLOBAL_Market_Factors.py < /dev/null
           
-          echo "🚀 步驟 4/4: 啟動 PCA 降維與 Ridge 脊迴歸模型，輸出明日大盤預測報告..."
+          echo "🚀 步驟 4/4: 啟動 PCA 降維與 Ridge 脊迴歸模型，並進行嚴格雲端讀寫校驗..."
           python PCA_TWII.py < /dev/null
 
-      # 6. 自動同步回 GitHub 倉庫
+      # 6. 自動同步回 GitHub 倉庫 (本地保險備份)
       - name: Commit and Push Updated Databases & Predictions
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Bot"
           git add -A
           if ! git diff --cached --quiet; then
-            git commit (避開檢查) -m "🤖 自動排程：同步更新歷史資料庫與明日 PCA 預測模型 [$(date +'%Y-%m-%d %H:%M:%S')]" || git commit -m "🤖 自動排程：同步更新歷史資料庫與明日 PCA 預測模型 [$(date +'%Y-%m-%d %H:%M:%S')]"
+            git commit -m "Automated update: sync historical databases and next-day PCA predictions with cloud verification"
             git push
             echo "✅ 成功將最新的歷史資料與預測結果同步推回 GitHub 倉庫！"
           else
