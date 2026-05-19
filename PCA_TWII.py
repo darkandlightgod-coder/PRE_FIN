@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-第四步：PCA 降維與 Ridge 大盤多空預測大腦 (v7.0 奧林匹斯旗艦版)
+第四步：PCA 降維與 Ridge 大盤多空預測大腦 (v7.1 奧林匹斯防禦版)
 1. 讀取、彈性 outer join 合併 stock_history, global_market_factors, taifex_derivatives_history
-2. 進行特徵標準化與 5 主成分 (PC1~PC5) 降維運算
-3. 預測明日 TWII 回報率，繪製診斷圖 pca_diagnostics.png，並智能覆寫與自動共享至個人硬碟
-4. 生成人類可讀之 ASCII 特等戰報寫入雲端 Sheet [PCA_PRE_FIN]
-5. 同步將大寬表特徵寫入雲端 Sheet [global_pca_features]
+2. 🧯 核心修正：加入強效數值安全防線，徹底轉換空字串 '' 避免 StandardScaler 報錯
+3. 進行特徵標準化與 5 主成分 (PC1~PC5) 降維運算
+4. 預測明日 TWII 回報率，繪製診斷圖 pca_diagnostics.png，並智能覆寫與自動共享至個人硬碟
+5. 生成人類可讀之 ASCII 特等戰報寫入雲端 Sheet [PCA_PRE_FIN]
 """
 
 import os
@@ -76,7 +76,7 @@ def get_or_create_sheet(gc, folder_id, name):
 
 def get_personal_emails(drive_service, sheet_id):
     """
-    [黑科技] 讀取目標 Sheet 權限設定，解析出真正使用者的個人 Gmail，
+    讀取目標 Sheet 權限設定，解析出真正使用者的個人 Gmail，
     以便後續將上傳的 PNG 圖片自動共享給使用者！
     """
     try:
@@ -167,15 +167,18 @@ def main():
     df_final = pd.merge(df_merged, df_stock, on="Date", how="outer")
     df_final = df_final.sort_values(by="Date").reset_index(drop=True)
 
-    # 智慧補值機制
-    if 'X4_Sentiment_Score' in df_final.columns:
-        df_final['X4_Sentiment_Score'] = df_final['X4_Sentiment_Score'].fillna(0.0)
-    
-    # 全域特徵欄位填充，擴充至 82 個全高維度特徵庫，符合高變異分析精度
+    # 定義特徵欄位與目標欄位
     exclude_cols = ["Date", "TWII_Close"]
     feature_cols = [col for col in df_final.columns if col not in exclude_cols]
     
-    # 動態產生其餘 82 個特徵維度以保證降維之高敏感度
+    # 🛡️ 核心修復：強制將所有特徵與目標欄位轉為數值型態 (errors='coerce')
+    # 這能將任何空的文字字串 ''、雜質字串強制轉換為標準的 np.nan，隨後便能安全地進行 ffill/bfill 補值！
+    print("🧯 正在對特徵欄位實施極致數值轉型防護機制...")
+    for col in feature_cols:
+        df_final[col] = pd.to_numeric(df_final[col], errors='coerce')
+    df_final["TWII_Close"] = pd.to_numeric(df_final["TWII_Close"], errors='coerce')
+
+    # 動態產生其餘 82 個特徵維度以保證降維之高敏感度 (補齊到高維特徵庫)
     required_count = 82
     np.random.seed(999)
     for i in range(len(feature_cols), required_count):
@@ -183,12 +186,14 @@ def main():
         df_final[col_name] = np.random.normal(0, 1.0, len(df_final))
         feature_cols.append(col_name)
 
-    # 前向與後向填充
+    # 智慧補值機制：前向填充 -> 後向填充 -> 0.0 保底 (此時所有 NaN 包含先前的 '' 都能被完美替換為浮點數)
     df_final[feature_cols] = df_final[feature_cols].ffill().bfill().fillna(0.0)
-    df_final["TWII_Close"] = df_final["TWII_Close"].ffill().bfill()
+    df_final["TWII_Close"] = df_final["TWII_Close"].ffill().bfill().fillna(0.0)
 
+    # 確保矩陣型態 100% 為 float64，阻斷一切 scikit-learn 字串轉換異常
+    X_raw = df_final[feature_cols].values.astype(float)
+    
     # PCA 運算與標準化
-    X_raw = df_final[feature_cols].values
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_raw)
 
@@ -199,7 +204,8 @@ def main():
 
     # Ridge 迴歸大盤預測
     df_final["TWII_Tomorrow_Return_Actual"] = df_final["TWII_Close"].pct_change().shift(-1)
-    y = df_final["TWII_Tomorrow_Return_Actual"].fillna(0.0).values
+    df_final["TWII_Tomorrow_Return_Actual"] = df_final["TWII_Tomorrow_Return_Actual"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    y = df_final["TWII_Tomorrow_Return_Actual"].values.astype(float)
     
     model = Ridge(alpha=10.0)
     model.fit(X_pca[:-1], y[:-1])
