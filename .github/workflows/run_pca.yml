@@ -26,13 +26,13 @@ jobs:
         with:
           python-version: '3.10'
 
-      # 3. 安裝必要套件 (包含 Google Sheets 與機器學習套件)
+      # 3. 安裝必要套件 (加入 google-api-python-client 以支援雲端硬碟自動覆蓋上傳)
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 gspread google-auth
+          pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 gspread google-auth google-api-python-client
 
-      # 4. 自適應目錄結構修復工程 (改用純英文變數，徹底解決 127 報錯問題)
+      # 4. 自適應目錄結構修復工程 (使用標準英文變數，避免 127 報錯問題)
       - name: Structure Autocure & File Migration
         run: |
           echo "🛠️ 啟動自適應目錄結構修復..."
@@ -55,16 +55,16 @@ jobs:
           echo "📁 目前最外層根目錄結構為："
           ls -la
 
-      # 5. 執行 5.0 版台股量化預測整合管線
+      # 5. 執行 6.0 版台股量化預測整合管線 (支援自動上傳 Drive 圖檔與 Google Sheets 寫入)
       - name: Execute PCA Prediction Pipeline
         env:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "🚀 啟動 5.0 版台股量化預測整合管線 (全功能整合執行)..."
+          echo "🚀 啟動 6.0 版台股量化預測整合管線 (全功能整合執行)..."
           python web_grab_and_language_AI_score_for_PCA.py < /dev/null
 
-      # 6. 自動將更新同步回 GitHub 倉庫 (此時 data/ 備份會留在最外層，順暢通關)
+      # 6. 自動將更新同步回 GitHub 倉庫
       - name: Commit and Push Updated Databases & Predictions
         run: |
           git config --local user.email "action@github.com"
