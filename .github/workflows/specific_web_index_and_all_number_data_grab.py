@@ -10,16 +10,16 @@ import json
 import random
 
 # ==========================================
-# 【1. 雲端自癒與自動化瀏覽器配置】
+# 【1. 環境自建環境自癒系統與 Playwright】
 # ==========================================
 def bootstrap():
-    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 specific_web_index_and_all_number_data_grab V4.0 環境自檢...")
+    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 TAIWAN_Futures V4.0 環境自檢...")
     dependencies = {
         "pandas": "pandas",
         "beautifulsoup4": "bs4",
         "playwright": "playwright",
         "gspread": "gspread",
-        "oauth2client": "oauth2client"
+        "google-auth": "google-auth"
     }
 
     installed_any = False
@@ -33,14 +33,13 @@ def bootstrap():
 
     if installed_any:
         importlib.invalidate_caches()
-        print("✅ 雲端運作路徑配置完畢。")
 
     try:
         from playwright.sync_api import sync_playwright
         print("🌐 檢查 Playwright 瀏覽器核心 (Chromium)...")
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], capture_output=True)
     except Exception as e:
-        print(f"⚠️ 瀏覽器核心檢索提醒: {e}")
+        print(f"⚠️ Playwright 初始化提示: {e}")
 
 bootstrap()
 
@@ -48,15 +47,17 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 # ==========================================
 # 【2. 動態路徑與雲端設定對齊】
 # ==========================================
-BASE_DIR = os.path.join(os.getcwd(), "data")
-os.makedirs(BASE_DIR, exist_ok=True)
-LOCAL_CSV_PATH = os.path.join(BASE_DIR, "taifex_derivatives_history.csv")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
 
+LOCAL_CSV_PATH = os.path.join(DATA_DIR, "taifex_derivatives_history.csv")
 CLOUD_SHEET_NAME = "taifex_derivatives_history"
 HEADLESS_MODE = True
 
@@ -73,41 +74,38 @@ COMMODITY_MAP = {
 }
 
 # ==========================================
-# 【3. 雲端 Google Sheets 雙向讀寫核心模組】
+# 【3. 嚴格雲端 Google Sheets 讀寫與校驗】
 # ==========================================
-def get_gspread_client():
+def connect_google_sheets_strictly():
     creds_json = os.environ.get("GSPREAD_CREDENTIALS")
-    if creds_json:
-        try:
-            creds_dict = json.loads(creds_json)
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            return gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope))
-        except Exception as e:
-            print(f"⚠️ 解析 GSPREAD_CREDENTIALS 失敗: {e}")
-            
-    local_creds = "credentials.json"
-    if os.path.exists(local_creds):
-        try:
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            return gspread.authorize(ServiceAccountCredentials.from_json_keyfile_name(local_creds, scope))
-        except: pass
-    return None
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+    
+    if not creds_json:
+        raise ValueError("❌ 找不到 GSPREAD_CREDENTIALS 金鑰，雲端寫入強制中斷！")
+    if not folder_id:
+        raise ValueError("❌ 找不到 GOOGLE_DRIVE_FOLDER_ID 變數，雲端寫入強制中斷！")
+        
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    creds_dict = json.loads(creds_json)
+    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc = gspread.authorize(credentials)
+    return gc, folder_id
 
 def load_historical_taifex():
-    gc = get_gspread_client()
-    if gc:
-        try:
-            sh = gc.open(CLOUD_SHEET_NAME)
-            records = sh.sheet1.get_all_records()
-            if records:
-                df = pd.DataFrame(records)
-                print(f"☁️ [雲端載入] 成功自 Google Sheets 讀取 {len(df)} 筆期權數據。")
-                return df
-        except Exception as e:
-            print(f"⚠️ 雲端期權數據讀取失敗 (將由本地遞補): {e}")
-            
+    try:
+        gc, _ = connect_google_sheets_strictly()
+        sh = gc.open(CLOUD_SHEET_NAME)
+        records = sh.sheet1.get_all_records()
+        if records:
+            df = pd.DataFrame(records)
+            print(f"☁️ [雲端讀取] 成功讀取 {len(df)} 筆期權數據。")
+            return df
+    except gspread.exceptions.SpreadsheetNotFound:
+        print(f"ℹ️ 雲端未發現 '{CLOUD_SHEET_NAME}'，嘗試載入本地快取...")
+    except Exception as e:
+        raise ConnectionError(f"❌ 雲端期權歷史數據讀取失敗，強制中斷執行：{e}")
+        
     if os.path.exists(LOCAL_CSV_PATH):
-        print(f"📂 [本地載入] 讀取本地期權數據歷史備份: {LOCAL_CSV_PATH}")
         return pd.read_csv(LOCAL_CSV_PATH)
     return pd.DataFrame()
 
@@ -115,20 +113,26 @@ def save_and_sync_taifex(df):
     df = df.sort_values(by="Date").reset_index(drop=True)
     df.to_csv(LOCAL_CSV_PATH, index=False, encoding="utf-8-sig")
     
-    gc = get_gspread_client()
-    if gc:
-        try:
-            try:
-                sh = gc.open(CLOUD_SHEET_NAME)
-            except gspread.exceptions.SpreadsheetNotFound:
-                sh = gc.create(CLOUD_SHEET_NAME)
-            sheet = sh.sheet1
-            sheet.clear()
-            df_clean = df.fillna("")
-            sheet.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
-            print(f"🎉 [雲端同步] 成功更新 Google Sheets '{CLOUD_SHEET_NAME}'，共 {len(df_clean)} 筆。")
-        except Exception as e:
-            print(f"❌ 雲端期權同步失敗: {e}")
+    gc, folder_id = connect_google_sheets_strictly()
+    try:
+        sh = gc.open(CLOUD_SHEET_NAME)
+    except gspread.exceptions.SpreadsheetNotFound:
+        print(f"➕ 正在雲端目標資料夾中全新建立: {CLOUD_SHEET_NAME}...")
+        sh = gc.create(CLOUD_SHEET_NAME, folder_id)
+        
+    worksheet = sh.sheet1
+    worksheet.clear()
+    
+    df_clean = df.fillna("")
+    data_to_sync = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
+    worksheet.update(values=data_to_sync, range_name="A1")
+    print("✅ 雲端期權資料同步成功！開始執行讀寫校驗...")
+    
+    # 讀寫一致性校驗
+    values = worksheet.get_all_values()
+    if len(values) != len(data_to_sync):
+        raise ValueError(f"❌ 雲端校驗失敗！預期寫入 {len(data_to_sync)} 行，但雲端實際只有 {len(values)} 行！")
+    print("🎉 雲端雙向校驗完全吻合！")
 
 # ==========================================
 # 【4. 爬蟲解析引擎】
@@ -255,7 +259,7 @@ def fetch_futures_day(context, target_date):
 # ==========================================
 def main():
     print("=" * 80)
-    print("🧠 期權高維特徵增量同步器 V4.0 (線上化自適應版)")
+    print("🧠 期權高維特徵增量同步器 V4.0 (雲端強校驗版)")
     print("=" * 80)
     
     df_old = load_historical_taifex()
@@ -277,15 +281,12 @@ def main():
 
     print(f"🔍 待補齊期權缺口天數: {len(target_dates)} 天工作日")
     if not target_dates:
-        print("🎉 [最新狀態] 本地與雲端期權歷史數據皆已同步，無須更新。")
-        print("=" * 80)
+        print("🎉 期權歷史數據已為最新，無需同步。")
         return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS_MODE)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+        context = browser.new_context(user_agent="Mozilla/5.0")
         
         new_records = []
         for idx, current_date in enumerate(target_dates):
