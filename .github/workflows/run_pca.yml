@@ -22,12 +22,11 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. 設定 Python 環境 (推薦 3.10)
+      # 2. 設定 Python 環境 (移除 cache 避免找不到 requirements.txt 報錯)
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip' # 快取 pip 套件以加速後續執行
 
       # 3. 安裝所有量化與機器學習必要套件
       - name: Install Python Dependencies
