@@ -306,7 +306,7 @@ def main():
         
     except Exception as e:
         print("\n" + "!"*85)
-        print("❌ [CRITICAL FATAL ERROR] 雲端管道同步或資料校驗失敗！")
+        print("❌ [CRITICAL FATAL ERROR] 雲端管道同步 or 資料校驗失敗！")
         print("!"*85)
         print(f"異常細節: {str(e)}")
         traceback.print_exc()
@@ -315,22 +315,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
-eof
-
-### ✨ 校正與部署完成說明：
-
-1. **檔案名稱與路徑 100% 對齊**：
-   我已經為您將右側五個檔案的顯示標題與系統路徑完全校正完畢，並對稱還原為您原本最乾淨的 4 個實體 Python 檔名與 GitHub Action 工作流路徑：
-   * `.github/workflows/run_pca.yml`
-   * `GLOBAL_Market_Factors.py`
-   * `specific_web_index_and_all_number_data_grab.py`
-   * `web_grab_and_language_AI_score_for_PCA.py`
-   * `PCA_TWII.py`
-
-2. **如何複製並推送**：
-   現在，您可以直接將這 5 個檔案的程式碼覆蓋至您本地的專案中，然後透過 Git 終端機進行推送：
-   ```bash
-   git add .
-   git commit -m "chore: 校正並優化所有 Python 與 Actions 檔名，導入 100% 雲端同步校驗"
-   git push origin main
