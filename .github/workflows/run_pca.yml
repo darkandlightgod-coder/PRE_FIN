@@ -1,31 +1,77 @@
-name: Automated_Stock_PCA_Pipeline
+name: Run PCA Prediction Pipeline
 
+# 觸發條件設定
 on:
   schedule:
-    # 💡 台北時間每日下午 16:30 執行 (國際標準時 UTC 08:30)
-    - cron: '30 8 * * *'
-  workflow_dispatch: # 支援手動點選「Run workflow」立即執行
+    # 台北時間週一至週五，每天晚上 18:30 自動執行 (對應 UTC 時間 10:30)
+    - cron: '30 10 * * 1-5'
+  
+  # 支援在 GitHub 網頁一鍵手動執行
+  workflow_dispatch:
+
+# 賦予 Action 寫入權限，以便將更新後的 CSV 與圖表 Push 回倉庫
+permissions:
+  contents: write
 
 jobs:
-  run-pca-pipeline:
+  run-pipeline:
     runs-on: ubuntu-latest
-    steps:
-      - name: 1. 複製 GitHub 倉庫程式碼
-        uses: actions/checkout@v3
 
-      - name: 2. 初始化 Python 3.10 環境
-        uses: actions/setup-python@v4
+    steps:
+      # 1. 檢出倉庫代碼
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2. 設定 Python 環境 (推薦 3.10)
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
+          cache: 'pip' # 快取 pip 套件以加速後續執行
 
-      - name: 3. 安裝 Python 依賴庫
+      # 3. 安裝所有量化與機器學習必要套件
+      - name: Install Python Dependencies
         run: |
-          pip install pandas numpy scikit-learn gspread oauth2client requests matplotlib google-api-python-client google-auth
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 playwright
 
-      - name: 4. 執行 PCA 預測引擎並與雲端 Google Sheets 聯動
+      # 4. 安裝 Playwright 瀏覽器核心及 Linux 系統依賴檔 (確保 Chromium 順利運行)
+      - name: Install Playwright Chromium with Deps
+        run: |
+          playwright install --with-deps chromium
+
+      # 5. 依序執行預測流水線中的 4 個 Python 腳本
+      - name: Execute PCA Prediction Pipeline
         env:
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+          # 將您的 GitHub Secrets 串接至環境變數 (若無設定，腳本會自動使用本地情緒引擎)
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python PCA_TWIIV1.0.py
+          echo "🚀 步驟 1/4: 開始抓取台股選擇權與三大法人數據..."
+          python specific_web_index_and_all_number_data_grab.py
+          
+          echo "🚀 步驟 2/4: 開始採集焦點財經新聞並進行 AI 情緒分析解構..."
+          python web_grab_and_language_AI_score_for_PCA.py
+          
+          echo "🚀 步驟 3/4: 開始抓取全球多維度關鍵市場特徵指標 (美股、大宗、匯率、加密貨幣)..."
+          python GLOBAL_Market_Factors.py
+          
+          echo "🚀 步驟 4/4: 啟動 PCA 降維與 Ridge 脊迴歸模型，輸出明日大盤預測報告..."
+          python PCA_TWII.py
+
+      # 6. 自動偵測 CSV 與圖表變更，提交並 Push 回您的 GitHub 倉庫
+      - name: Commit and Push Updated Databases & Predictions
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+          
+          # 將所有新產生的 CSV 歷史數據、模型及圖表加入暫存區
+          git add -A
+          
+          # 檢查是否有任何檔案被修改或新增，避免無變更時提交導致出錯
+          if ! git diff --cached --quiet; then
+            git commit -m "🤖 自動排程：同步更新歷史資料庫與明日 PCA 預測模型 [$(date +'%Y-%m-%d %H:%M:%S')]"
+            git push
+            echo "✅ 成功將最新的歷史資料與預測結果同步推回 GitHub 倉庫！"
+          else
+            echo "ℹ️ 資料庫內容無任何變動，跳過提交。"
+          fi
