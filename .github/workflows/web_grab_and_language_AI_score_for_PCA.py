@@ -11,10 +11,10 @@ import json
 import urllib.parse
 
 # ==========================================
-# 【1. 雲端自癒環境檢測】
+# 【1. 雲端自適應環境自癒系統】
 # ==========================================
 def bootstrap():
-    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 web_grab_and_language_AI_score_for_PCA V4.0 環境自檢...")
+    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 web_grab_and_language_AI_score_for_PCA V4.0 環境檢測...")
     dependencies = {
         "pandas": "pandas",
         "yfinance": "yfinance",
@@ -25,7 +25,7 @@ def bootstrap():
         "snownlp": "snownlp",
         "vaderSentiment": "vaderSentiment",
         "gspread": "gspread",
-        "oauth2client": "oauth2client"
+        "google-auth": "google-auth"
     }
 
     installed_any = False
@@ -33,13 +33,12 @@ def bootstrap():
         try:
             importlib.import_module(module)
         except ImportError:
-            print(f"📦 正在自動安裝缺失套件: {package}...")
+            print(f"📦 正在自動安裝套件: {package}...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", package])
             installed_any = True
 
     if installed_any:
         importlib.invalidate_caches()
-        print("✅ 輿情套件與語意引擎準備完畢。")
     
     try:
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], capture_output=True)
@@ -56,65 +55,62 @@ import requests
 from snownlp import SnowNLP
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 nest_asyncio.apply()
 
 # ==========================================
 # 【2. 動態路徑與雲端設定對齊】
 # ==========================================
-BASE_DIR = os.path.join(os.getcwd(), "data")
-os.makedirs(BASE_DIR, exist_ok=True)
-LOCAL_CSV_PATH = os.path.join(BASE_DIR, "stock_history.csv")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
 
-# Google Drive 試算表名稱對齊
+LOCAL_CSV_PATH = os.path.join(DATA_DIR, "stock_history.csv")
 CLOUD_SHEET_NAME = "stock_history"
 HEADLESS_MODE = True
 
 MAX_CONCURRENT_KEYWORDS = 2
 MAX_CONCURRENT_ARTICLES = 2
 
-# 🧱 輿情採集核心關鍵字
 TIER1_KEYWORDS = ["台股 大盤"]
 TIER2_KEYWORDS = ["Taiwan Stock Market Index", "費城半導體"]
 TIER3_KEYWORDS = ["TSMC ADR stock news", "MSCI Taiwan Index"]
 
 # ==========================================
-# 【3. 雲端 Google Sheets 雙向同步模組】
+# 【3. 嚴格雲端 Google Sheets 讀寫與校驗】
 # ==========================================
-def get_gspread_client():
+def connect_google_sheets_strictly():
     creds_json = os.environ.get("GSPREAD_CREDENTIALS")
-    if creds_json:
-        try:
-            creds_dict = json.loads(creds_json)
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            return gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope))
-        except Exception as e:
-            print(f"⚠️ 解析 GSPREAD_CREDENTIALS 失敗: {e}")
-            
-    local_creds = "credentials.json"
-    if os.path.exists(local_creds):
-        try:
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            return gspread.authorize(ServiceAccountCredentials.from_json_keyfile_name(local_creds, scope))
-        except: pass
-    return None
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+    
+    if not creds_json:
+        raise ValueError("❌ 找不到 GSPREAD_CREDENTIALS 金鑰，雲端寫入強制中斷！")
+    if not folder_id:
+        raise ValueError("❌ 找不到 GOOGLE_DRIVE_FOLDER_ID 變數，雲端寫入強制中斷！")
+        
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    creds_dict = json.loads(creds_json)
+    credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc = gspread.authorize(credentials)
+    return gc, folder_id
 
 def load_historical_舆情():
-    gc = get_gspread_client()
-    if gc:
-        try:
-            sh = gc.open(CLOUD_SHEET_NAME)
-            records = sh.sheet1.get_all_records()
-            if records:
-                df = pd.DataFrame(records)
-                print(f"☁️ [雲端載入] 成功自 Google Sheets 讀取 {len(df)} 筆歷史輿情資料。")
-                return df
-        except Exception as e:
-            print(f"⚠️ 雲端輿情讀取失敗 (將由本地快取遞補): {e}")
-            
+    try:
+        gc, _ = connect_google_sheets_strictly()
+        sh = gc.open(CLOUD_SHEET_NAME)
+        records = sh.sheet1.get_all_records()
+        if records:
+            df = pd.DataFrame(records)
+            print(f"☁️ [雲端讀取] 成功讀取 {len(df)} 筆歷史輿情資料。")
+            return df
+    except gspread.exceptions.SpreadsheetNotFound:
+        print(f"ℹ️ 雲端未發現 '{CLOUD_SHEET_NAME}'，嘗試載入本地快取...")
+    except Exception as e:
+        raise ConnectionError(f"❌ 雲端輿情歷史數據讀取失敗，強制中斷執行：{e}")
+        
     if os.path.exists(LOCAL_CSV_PATH):
-        print(f"📂 [本地載入] 讀取本地輿情歷史快取: {LOCAL_CSV_PATH}")
         return pd.read_csv(LOCAL_CSV_PATH)
     return pd.DataFrame()
 
@@ -122,20 +118,25 @@ def save_and_sync_舆情(df):
     df = df.sort_values(by="Date").reset_index(drop=True)
     df.to_csv(LOCAL_CSV_PATH, index=False, encoding="utf-8-sig")
     
-    gc = get_gspread_client()
-    if gc:
-        try:
-            try:
-                sh = gc.open(CLOUD_SHEET_NAME)
-            except gspread.exceptions.SpreadsheetNotFound:
-                sh = gc.create(CLOUD_SHEET_NAME)
-            sheet = sh.sheet1
-            sheet.clear()
-            df_clean = df.fillna("")
-            sheet.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
-            print(f"🎉 [雲端同步] 成功覆蓋更新 Google Sheets '{CLOUD_SHEET_NAME}'，共 {len(df_clean)} 筆。")
-        except Exception as e:
-            print(f"❌ 雲端輿情同步失敗: {e}")
+    gc, folder_id = connect_google_sheets_strictly()
+    try:
+        sh = gc.open(CLOUD_SHEET_NAME)
+    except Exception:
+        sh = gc.create(CLOUD_SHEET_NAME, folder_id)
+        
+    worksheet = sh.sheet1
+    worksheet.clear()
+    
+    df_clean = df.fillna("")
+    data_to_sync = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
+    worksheet.update(values=data_to_sync, range_name="A1")
+    print("✅ 雲端輿情資料同步成功！開始執行讀寫校驗...")
+    
+    # 讀寫一致性校驗
+    values = worksheet.get_all_values()
+    if len(values) != len(data_to_sync):
+        raise ValueError(f"❌ 雲端校驗失敗！預期寫入 {len(data_to_sync)} 行，但雲端實際只有 {len(values)} 行！")
+    print("🎉 輿情雲端雙向校驗完全吻合！")
 
 # ==========================================
 # 【4. 數據採集與解析邏輯】
@@ -179,7 +180,7 @@ async def grab_news(days=1):
             browser = await p.chromium.launch(headless=HEADLESS_MODE)
             context = await browser.new_context(
                 viewport={'width': 1280, 'height': 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0"
             )
             await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
