@@ -26,6 +26,6 @@ jobs:
           # 修正重點：確保變數名與 Secret 設定完全對應
           SPREADSHEET_KEY: ${{ secrets.SPREADSHEET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GSPREAD_CREDENTIALS: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GSPREAD_CREDENTIALS: ${{ secrets. GSPREAD_CREDENTIALS }}
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
         run: python test_google_connection.py
