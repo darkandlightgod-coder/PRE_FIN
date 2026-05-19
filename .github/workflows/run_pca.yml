@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      # 3. 安裝必要套件 (加入 google-api-python-client 以支援雲端硬碟自動覆蓋上傳)
+      # 3. 安裝必要套件 (加入 yfinance 以及所有 API 必要庫)
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
@@ -36,8 +36,6 @@ jobs:
       - name: Structure Autocure & File Migration
         run: |
           echo "🛠️ 啟動自適應目錄結構修復..."
-          
-          # 使用標準英文變數 MISPLACED_FILES，避免 Bash 解析失敗
           MISPLACED_FILES=$(find .github/workflows/ -maxdepth 1 -name "*.py")
           
           if [ ! -z "$MISPLACED_FILES" ]; then
@@ -46,7 +44,6 @@ jobs:
             mv .github/workflows/*.py ./
           fi
           
-          # 清除可能產生在管制區底下的 data 快取，防止被 GitHub Security 阻擋
           if [ -d ".github/workflows/data" ]; then
             echo "🧹 清除管制區殘留之舊 data 快取目錄..."
             rm -rf .github/workflows/data
@@ -55,16 +52,16 @@ jobs:
           echo "📁 目前最外層根目錄結構為："
           ls -la
 
-      # 5. 執行 6.0 版台股量化預測整合管線 (支援自動上傳 Drive 圖檔與 Google Sheets 寫入)
+      # 5. 執行 7.0 旗艦五合一全自動整合管線
       - name: Execute PCA Prediction Pipeline
         env:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "🚀 啟動 6.0 版台股量化預測整合管線 (全功能整合執行)..."
+          echo "🚀 啟動 7.0 版台股量化預測整合管線 (全五合一功能整合執行)..."
           python web_grab_and_language_AI_score_for_PCA.py < /dev/null
 
-      # 6. 自動將更新同步回 GitHub 倉庫
+      # 6. 自動將本地更新與備份資料同步回 GitHub 倉庫
       - name: Commit and Push Updated Databases & Predictions
         run: |
           git config --local user.email "action@github.com"
@@ -76,7 +73,7 @@ jobs:
           git add data/ 2>/dev/null || true
           
           if ! git diff --quiet --cached; then
-            git commit -m "Automated update: sync historical backup databases and next-day PCA predictions"
+            git commit -m "Automated update: sync 5 database backups and visual plots"
             git push origin main
             echo "✅ 成功將最新的歷史資料與預測結果同步推回 GitHub 倉庫！"
           else
