@@ -2,28 +2,28 @@ name: PCA TWII Daily Pipeline
 
 on:
   schedule:
-    # 每天台灣時間早上 09:00 執行 (UTC 01:00)
-    - cron: '0 1 * * *'
-  workflow_dispatch: # 允許手動觸發測試
+    - cron: '0 1 * * *' # 每天 UTC 01:00
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          pip install pandas numpy scikit-learn gspread google-auth google-api-python-client requests matplotlib
+          pip install pandas numpy scikit-learn gspread google-auth google-api-python-client requests matplotlib yfinance
 
-      - name: Run Five-in-One Pipeline
+      - name: Run Master Pipeline
         env:
+          # 修正重點：確保變數名與 Secret 設定完全對應
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_KEY: ${{ secrets.SPREADSHEET_KEY }}
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
