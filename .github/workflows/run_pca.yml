@@ -1,81 +1,39 @@
-name: Run PCA Prediction Pipeline
+name: Web Scraping, AI Scoring, and PCA Analysis Pipeline
 
 on:
+  push:
+    branches: [ main, master ]
   schedule:
-    # 台北時間週一至週五，每天晚上 18:30 自動執行 (對應 UTC 時間 10:30)
-    - cron: '30 10 * * 1-5'
-  
-  # 支援在 GitHub 網頁一鍵手動執行
+    # 每天凌晨 00:00 (UTC) 自動執行一次
+    - cron: '0 0 * * *'
   workflow_dispatch:
-
-permissions:
-  contents: write
+    # 允許在 GitHub 介面上手動觸發執行
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. 檢出倉庫代碼
-      - name: Checkout Repository
+      - name: 檢出專案代碼
         uses: actions/checkout@v4
 
-      # 2. 設定 Python 環境
-      - name: Set up Python 3.10
+      - name: 設定 Python 環境
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
-      # 3. 安裝必要套件 (加入 yfinance 以及所有 API 必要庫)
-      - name: Install Python Dependencies
+      - name: 安裝相依套件
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 gspread google-auth google-api-python-client
+          pip install pandas numpy scikit-learn matplotlib seaborn requests gspread google-auth google-api-python-client
 
-      # 4. 自適應目錄結構修復工程 (使用標準英文變數，避免 127 報錯問題)
-      - name: Structure Autocure & File Migration
-        run: |
-          echo "🛠️ 啟動自適應目錄結構修復..."
-          MISPLACED_FILES=$(find .github/workflows/ -maxdepth 1 -name "*.py")
-          
-          if [ ! -z "$MISPLACED_FILES" ]; then
-            echo "⚠️ 偵測到有 Python 腳本被放置在安全管制區 (.github/workflows/) 內！"
-            echo "🚀 正在將腳本自動安全移往『最外層根目錄』以符合安全規範..."
-            mv .github/workflows/*.py ./
-          fi
-          
-          if [ -d ".github/workflows/data" ]; then
-            echo "🧹 清除管制區殘留之舊 data 快取目錄..."
-            rm -rf .github/workflows/data
-          fi
-          
-          echo "📁 目前最外層根目錄結構為："
-          ls -la
-
-      # 5. 執行 7.0 旗艦五合一全自動整合管線
-      - name: Execute PCA Prediction Pipeline
+      - name: 執行資料處理與分析管線
         env:
-          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-          PYTHONUNBUFFERED: "1"
+          # 🔗 將 GitHub Secrets 橋接至執行環境變數
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          echo "🚀 啟動 7.0 版台股量化預測整合管線 (全五合一功能整合執行)..."
-          python web_grab_and_language_AI_score_for_PCA.py < /dev/null
-
-      # 6. 自動將本地更新與備份資料同步回 GitHub 倉庫
-      - name: Commit and Push Updated Databases & Predictions
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action Bot"
-          
-          # 追蹤外層的代碼與自動備份資料夾變動
-          git add *.py
-          git rm -r --cached .github/workflows/data 2>/dev/null || true
-          git add data/ 2>/dev/null || true
-          
-          if ! git diff --quiet --cached; then
-            git commit -m "Automated update: sync 5 database backups and visual plots"
-            git push origin main
-            echo "✅ 成功將最新的歷史資料與預測結果同步推回 GitHub 倉庫！"
-          else
-            echo "ℹ️ 資料庫內容無任何變動，跳過提交。"
-          fi
+          # 🎯 執行您指定檔名的主控分析流程
+          python web_grab_and_language_AI_score_for_PCA.py
