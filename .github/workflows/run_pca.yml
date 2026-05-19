@@ -1,111 +1,32 @@
-name: Run PCA Prediction Pipeline
+name: PCA TWII Daily Pipeline
 
 on:
   schedule:
-    # 台北時間週一至週五，每天晚上 18:30 自動執行 (對應 UTC 時間 10:30)
-    - cron: '30 10 * * 1-5'
-  
-  # 支援在 GitHub 網頁一鍵手動執行
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    # 每天台灣時間早上 09:00 執行 (UTC 01:00)
+    - cron: '0 1 * * *'
+  workflow_dispatch: # 允許手動觸發測試
 
 jobs:
-  run-pipeline:
+  build:
     runs-on: ubuntu-latest
-
-    env:
-      # 強制所有 JS Action 直接使用 Node.js 24 執行環境，徹底阻斷 Deprecated 警告
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
     steps:
-      # 1. 檢出倉庫代碼 (已升級至支援 Node.js 24 的原生 v6 版本)
-      - name: Checkout Repository
-        uses: actions/checkout@v6
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-      # 2. 設定 Python 環境 (已升級至支援 Node.js 24 的原生 v6 版本)
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v6
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.9'
 
-      # 3. 安裝必要套件 (包含所有 Google API、機器學習、爬蟲與繪圖套件)
-      - name: Install Python Dependencies
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 gspread google-auth google-api-python-client
+          pip install pandas numpy scikit-learn gspread google-auth google-api-python-client requests matplotlib
 
-      # 4. 目錄結構自動校正 (自動將誤放到 .github 中的 .py 腳本安全移回根目錄)
-      - name: Structure Autocure & File Migration
-        run: |
-          echo "🛠️ 啟動自適應目錄結構修復..."
-          MISPLACED_FILES=$(find .github/workflows/ -maxdepth 1 -name "*.py")
-          
-          if [ ! -z "$MISPLACED_FILES" ]; then
-            echo "⚠️ 偵測到有 Python 腳本被放置在安全管制區 (.github/workflows/) 內！"
-            echo "🚀 正在將腳本自動安全移往『最外層根目錄』以符合安全規範..."
-            mv .github/workflows/*.py ./
-          fi
-          
-          if [ -d ".github/workflows/data" ]; then
-            echo "🧹 清除管制區殘留之舊 data 快取目錄..."
-            rm -rf .github/workflows/data
-          fi
-          
-          echo "📁 目前最外層根目錄結構為："
-          ls -la
-
-      # 5. 執行四步鏈接自動預測管線 (步驟 1~4 依序執行)
-      - name: Execute PCA Prediction Pipeline
+      - name: Run Five-in-One Pipeline
         env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_KEY: ${{ secrets.SPREADSHEET_KEY }}
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-          PYTHONUNBUFFERED: "1"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          echo "🚀 步驟 1/4: 開始抓取台股選擇權與三大法人籌碼數據..."
-          python specific_web_index_and_all_number_data_grab.py < /dev/null
-          
-          echo "🚀 步驟 2/4: 開始採集焦點財經新聞並進行 AI 本地語意計分..."
-          python web_grab_and_language_AI_score_for_PCA.py < /dev/null
-          
-          echo "🚀 步驟 3/4: 開始抓取全球多維度關鍵市場特徵指標..."
-          python GLOBAL_Market_Factors.py < /dev/null
-          
-          echo "🚀 步驟 4/4: 啟動 PCA 降維與 Ridge 預測，並輸出圖檔與人類直觀戰報..."
-          python PCA_TWII.py < /dev/null
-
-      # 6. 自動將本地更新與備份資料同步回 GitHub 倉庫
-      - name: Commit and Push Updated Databases & Predictions
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action Bot"
-          
-          # 追蹤外層的代碼與自動備份資料夾變動
-          git add *.py
-          git rm -r --cached .github/workflows/data 2>/dev/null || true
-          git add data/ 2>/dev/null || true
-          
-          if ! git diff --quiet --cached; then
-            git commit -m "Automated update: sync 5 database backups and visual plots"
-            git push origin main
-            echo "✅ 成功將最新的歷史資料與預測結果同步推回 GitHub 倉庫！"
-          else
-            echo "ℹ️ 資料庫內容無任何變動，跳過提交。"
-          fi
-```
-eof
-
----
-
-### 💡 您的 Google Drive 會基於哪一個 `.py` 檔案生成圖片？
-
-答案是：**`PCA_TWII.py`**（也就是整個分析管線的最後一步：**第 4 步的大腦程式**）。
-
-#### 🔍 這張圖片是如何在雲端產生的？運作機制解析：
-
-1. **本地繪製與存檔**：
-   在 `PCA_TWII.py` 執行過程中，Matplotlib 繪圖庫會讀取最新的 PCA 主成分分析結果（降維解釋度）與大盤多空預測軌跡（實際與預測回報率），並調用以下代碼將圖表繪製出來並暫存在 Runner 的虛擬主機中：
-   ```python
-   local_plot_path = "data/pca_diagnostics.png"
-   plt.savefig(local_plot_path, dpi=300)
+          python web_grab_and_language_AI_score_for_PCA.py
