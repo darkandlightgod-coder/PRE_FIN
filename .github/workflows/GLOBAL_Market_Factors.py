@@ -75,9 +75,9 @@ def connect_google_sheets_strictly():
     folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
     
     if not creds_json:
-        raise ValueError("❌ [CRITICAL] 找不到 GSPREAD_CREDENTIALS 金鑰，雲端強制中斷！")
+        raise ValueError("❌ 找不到 GSPREAD_CREDENTIALS 金鑰，雲端強制中斷！")
     if not folder_id:
-        raise ValueError("❌ [CRITICAL] 找不到 GOOGLE_DRIVE_FOLDER_ID 變數，雲端強制中斷！")
+        raise ValueError("❌ 找不到 GOOGLE_DRIVE_FOLDER_ID 變數，雲端強制中斷！")
         
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds_dict = json.loads(creds_json)
