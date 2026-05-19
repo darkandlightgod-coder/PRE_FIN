@@ -49,7 +49,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ==========================================
 # 【2. 雲端路徑與參數設定對齊】
 # ==========================================
-# 雲端執行時預設之本地快取備用目錄
 BASE_DIR = os.path.join(os.getcwd(), "data")
 os.makedirs(BASE_DIR, exist_ok=True)
 LOCAL_CSV_PATH = os.path.join(BASE_DIR, "global_market_factors.csv")
@@ -82,7 +81,6 @@ def get_gspread_client():
         except Exception as e:
             print(f"⚠️ 解析 GSPREAD_CREDENTIALS 失敗: {e}")
             
-    # 本地測試回退憑證
     local_creds = "credentials.json"
     if os.path.exists(local_creds):
         try:
@@ -92,9 +90,6 @@ def get_gspread_client():
     return None
 
 def load_historical_data():
-    """
-    雙向載入：第一優先從雲端 Google Sheets 讀取歷史因子，連線失敗則使用本地快取
-    """
     gc = get_gspread_client()
     if gc:
         try:
@@ -115,9 +110,6 @@ def load_historical_data():
     return pd.DataFrame()
 
 def save_and_sync_data(df):
-    """
-    雙向儲存：同步保存本地 CSV 備份，並覆蓋寫回 Google Sheets
-    """
     df = df.sort_values(by="Date").reset_index(drop=True)
     df.to_csv(LOCAL_CSV_PATH, index=False, encoding="utf-8-sig")
     print(f"💾 [本地備份] 歷史因子已保存至本地快取: {LOCAL_CSV_PATH}")
@@ -151,9 +143,6 @@ def convert_roc_date_to_ce(roc_date_str):
     return roc_date_str
 
 def fetch_twse_index_data_day(session, target_date):
-    """
-    抓取指定日期的 TWSE 收盤價 (帶 rate limit 容錯與 yfinance 備用機制)
-    """
     date_str = target_date.strftime("%Y%m%d")
     date_slash = target_date.strftime("%Y/%m/%d")
     url = f"https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={date_str}"
@@ -174,7 +163,7 @@ def fetch_twse_index_data_day(session, target_date):
     return {}
 
 def fetch_yfinance_factors_bulk(start_str, end_str):
-    tickers = list(set(FACTOR_MAP.values()) | {"^TWII"}) # 同步將 ^TWII 做為收盤價的安全遞補源
+    tickers = list(set(FACTOR_MAP.values()) | {"^TWII"})
     try:
         df_bulk = yf.download(tickers, start=start_str, end=end_str, progress=False, auto_adjust=True)
         if df_bulk.empty:
@@ -188,7 +177,6 @@ def fetch_yfinance_factors_bulk(start_str, end_str):
             else:
                 out_data[factor_name] = df_bulk[field].values if field in df_bulk.columns else [None] * len(df_bulk)
         
-        # 額外抽取 ^TWII 備用大盤 Close
         if is_multi:
             out_data["YF_TWII_Close"] = df_bulk[("Close", "^TWII")].values if ("Close", "^TWII") in df_bulk.columns else [None] * len(df_bulk)
         else:
@@ -203,23 +191,21 @@ def fetch_yfinance_factors_bulk(start_str, end_str):
     return pd.DataFrame()
 
 # ==========================================
-# 【5. 核心增量與對齊控制流】
+# 【5. 核心控制流】
 # ==========================================
 def main():
     print("=" * 80)
-    print("🧠 GLOBAL_Market_Factors V4.0 - 雲端/線上化自適應大寬表同步器")
+    print("🧠 GLOBAL_Market_Factors V4.0 - 雲端大寬表同步器")
     print("=" * 80)
     
-    # 1. 載入歷史數據 (優先從 Google Sheets 雲端獲取)
     df_old = load_historical_data()
     existing_dates = set()
     if not df_old.empty and "Date" in df_old.columns:
         existing_dates = set(df_old["Date"].astype(str).tolist())
 
-    # 2. 定義時間範圍：初始化回溯起點設為 2025/12/25
     start_date = datetime(2025, 12, 25)
     end_date = datetime.now()
-    if end_date.hour < 21: # 若未達晚間收盤結算，退回一日
+    if end_date.hour < 21:
         end_date = end_date - timedelta(days=1)
         
     delta_days = (end_date - start_date).days
@@ -233,11 +219,10 @@ def main():
         
     print(f"📅 待補歷史日期缺口: {len(target_dates)} 天工作日")
     if not target_dates:
-        print("🎉 [最新狀態] 大寬表數據已 100% 與最新交易日對齊，無須更新。")
+        print("🎉 [最新狀態] 大寬表數據已 100% 同步，無須更新。")
         print("=" * 80)
         return
 
-    # 3. 採集 TWSE 收盤價數據 (帶擬人防爬機制)
     print("\n[第一階段] 🌐 正在採集台股現貨大盤收盤價...")
     twse_records = []
     with requests.Session() as session:
@@ -249,7 +234,7 @@ def main():
                 twse_records.append(day_data)
                 print(f"      ✅ 官方大盤收盤: {day_data['TWII_Close']:,.2f}")
             else:
-                print(f"      ⚠️ 官方 API 未獲取 (將在下一階段由 Yahoo Finance 自動遞補)。")
+                print(f"      ⚠️ 官方 API 未獲取，將由 Yahoo Finance 備用自動遞補。")
             if idx < len(target_dates) - 1:
                 time.sleep(2.5)
 
@@ -257,26 +242,18 @@ def main():
     if df_twse_new.empty:
         df_twse_new = pd.DataFrame(columns=["Date", "TWII_Close"])
 
-    # 4. 採集 Yahoo Finance 與合併
     start_yf_str = (start_date - timedelta(days=5)).strftime("%Y-%m-%d")
     end_yf_str = (end_date + timedelta(days=2)).strftime("%Y-%m-%d")
     df_yfinance = fetch_yfinance_factors_bulk(start_yf_str, end_yf_str)
     
     if not df_yfinance.empty:
         print("\n[第二階段] 📊 正在將現貨與全球因子進行對齊與安全備用遞補...")
-        # 將待補日期轉為 DataFrame 與 Yahoo Finance 對齊
         df_target_dates = pd.DataFrame({"Date": [d.strftime("%Y/%m/%d") for d in target_dates]})
         df_new_aligned = pd.merge(df_target_dates, df_yfinance, on="Date", how="inner")
-        
-        # 將官方大盤收盤價與 yfinance 備用收盤價合併對齊
         df_new_aligned = pd.merge(df_new_aligned, df_twse_new, on="Date", how="left")
         
-        # 💡 【核心自癒機制】：如果 TWSE 官方 API 遭到 Rate Limit 限制，
-        # 自動以 yfinance 下載的 YF_TWII_Close 安全遞補，確保線上化自動運行絕不崩潰！
         df_new_aligned["TWII_Close"] = df_new_aligned["TWII_Close"].fillna(df_new_aligned["YF_TWII_Close"])
         df_new_aligned = df_new_aligned.drop(columns=["YF_TWII_Close"])
-        
-        # 排除收盤價依然為空的無效週末/休市列
         df_new_aligned = df_new_aligned.dropna(subset=["TWII_Close"])
 
         if not df_new_aligned.empty:
@@ -284,7 +261,7 @@ def main():
             df_final = df_final.drop_duplicates(subset=['Date'], keep='last')
             save_and_sync_data(df_final)
         else:
-            print("⚠️ [警告] 對齊合併後無有效數據，可能該期間台股全數休市。")
+            print("⚠️ [警告] 對齊合併後無有效數據。")
     else:
         print("❌ [警告] Yahoo Finance 數據獲取失敗，終止同步。")
 
