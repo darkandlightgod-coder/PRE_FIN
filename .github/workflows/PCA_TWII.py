@@ -11,7 +11,7 @@ import importlib
 # 【1. 環境自癒：確保量化與 Google Cloud 依賴庫完整】
 # ==========================================
 def bootstrap():
-    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 PCA_TWII_Strict_CloudV5.0 運行環境自檢...")
+    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 PCA_TWII_Strict_CloudV5.1 運行環境自檢...")
     dependencies = {
         "pandas": "pandas",
         "numpy": "numpy",
@@ -139,12 +139,12 @@ def verify_cloud_write(worksheet, expected_rows, expected_cols):
         raise IOError(f"❌ [CRITICAL ERROR] 執行雲端讀寫一致性校驗時發生致命異常: {str(e)}")
 
 # ==========================================
-# 【4. 核心：智慧多源資料庫加載與對齊】
+# 【4. 核心：智慧多源資料庫加載與彈性對齊】
 # ==========================================
 def load_and_align_datasets():
     print("⏳ [Step 1] 正在啟動嚴格雲端對齊通道...")
     
-    # 建立強耦合的 Google 連線。若失敗此處將拋出異常，整個 Actions 會直接亮紅燈報報，絕不降級。
+    # 建立強耦合的 Google 連線
     gc, credentials, folder_id = connect_google_sheets_strictly()
     
     print("☁️ [多因子雲端大合流] 正在讀取三張特徵試算表...")
@@ -167,19 +167,29 @@ def load_and_align_datasets():
     if "NLP_Engine" in df_sent.columns:
         df_sent = df_sent.drop(columns=["NLP_Engine"])
         
-    print(f"   📊 雲端數據規模：總經({len(df_macro)}天), 期權({len(df_deriv)}天), 輿情({len(df_sent)}天)")
+    print(f"   📊 雲端原始規模：總經({len(df_macro)}天), 期權({len(df_deriv)}天), 輿情({len(df_sent)}天)")
     
-    # 進行多表 Inner Join 對齊
-    df_merged = pd.merge(df_macro, df_deriv, on="Date", how="inner")
-    df_final = pd.merge(df_merged, df_sent, on="Date", how="inner")
+    # 🌟 改採 Outer Join (並集聯結) 避免因為今日/昨日時間差產生 0 天空集 🌟
+    df_merged = pd.merge(df_macro, df_deriv, on="Date", how="outer")
+    df_final = pd.merge(df_merged, df_sent, on="Date", how="outer")
     
-    # 排序日期
+    # 重新依日期排序確保時間序列順序
     df_final = df_final.sort_values(by="Date").reset_index(drop=True)
     
+    # 🌟 智慧缺值填充機制，防止機器學習與標準化崩潰 🌟
+    # 1. 輿情分數如果缺值，填充 0.0 (代表中性情緒)，防止歷史空值被單一最新值污染
+    if "X4_Sentiment_Score" in df_final.columns:
+        df_final["X4_Sentiment_Score"] = df_final["X4_Sentiment_Score"].fillna(0.0)
+    
+    # 2. 其他量化因子（如大盤收盤、期權未平倉），使用時間序列的前向與後向遞補 (ffill / bfill)
+    exclude_cols = ["Date"]
+    fill_cols = [col for col in df_final.columns if col not in exclude_cols]
+    df_final[fill_cols] = df_final[fill_cols].ffill().bfill().fillna(0.0)
+    
     if len(df_final) < 5:
-        raise ValueError(f"❌ 經時間軸對齊後的有效交集天數過少 ({len(df_final)} 天)，無法進行降維機器學習！")
+        raise ValueError(f"❌ 經時間軸彈性對齊後的有效交集天數過少 ({len(df_final)} 天)，無法進行降維機器學習！")
         
-    print(f"   🎯 雲端多源因子對齊完成！共 {len(df_final)} 天。準備同步回雲端試算表...")
+    print(f"   🎯 雲端多源因子彈性對齊完成！共 {len(df_final)} 天。準備同步回雲端試算表...")
     
     # 將對齊後的特徵同步至雲端 global_pca_features
     sync_aligned_data_to_google_drive(gc, credentials, folder_id, df_final)
@@ -207,10 +217,10 @@ def sync_aligned_data_to_google_drive(gc, credentials, folder_id, df):
 def run_pca_prediction_pipeline(df):
     print("⏳ [Step 2] 正在進行主成分分析 (PCA) 降維...")
     
-    exclude_cols = ["Date", "TWII_Close", "TWII_Change", "TWII_Vol_Change"]
+    exclude_cols = ["Date", "TWII_Close", "TWII_Change", "TWII_Vol_Change", "TWII_Today_Return", "Next_TWII_Change"]
     feature_cols = [col for col in df.columns if col not in exclude_cols and df[col].dtype in [np.float64, np.int64]]
     
-    X_raw = df[feature_cols].ffill().bfill()
+    X_raw = df[feature_cols]
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_raw)
     
@@ -224,8 +234,11 @@ def run_pca_prediction_pipeline(df):
     df["TWII_Today_Return"] = df["TWII_Today_Return"].fillna(0.0)
     df['Next_TWII_Change'] = df['TWII_Today_Return'].shift(-1)
     
+    # 劃分訓練集 (不包含無法取得明日報酬率的最新一天)
     X_train = X_pca[:-1]
     y_train = df['Next_TWII_Change'].iloc[:-1].values
+    
+    # 今日最新特徵向量 (用於預測明日大盤)
     X_predict_tomorrow = X_pca[-1:]
     
     model = Ridge(alpha=15.0)
@@ -279,10 +292,10 @@ def sync_prediction_report_to_google_drive(report_df):
 # ==========================================
 def main():
     print("="*85)
-    print("🧠 PCA_TWII V5.0 - 【嚴格雲端強校驗模式】全面啟用！")
+    print("🧠 PCA_TWII V5.1 - 【嚴格雲端強校驗與智慧彈性對齊模式】全面啟用！")
     print("="*85)
     try:
-        # Step 1: 讀取、對齊，並強行寫入 Google Sheets 對齊數據庫
+        # Step 1: 讀取、彈性對齊，並強行寫入 Google Sheets 對齊數據庫
         df_aligned = load_and_align_datasets()
         
         # Step 2: 執行 PCA 與 Ridge 迴歸，並強行同步預測歷史至 Google Sheet
