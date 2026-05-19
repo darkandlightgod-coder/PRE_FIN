@@ -20,7 +20,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. 設定 Python 環境 (無快取乾淨安裝)
+      # 2. 設定 Python 環境
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
@@ -37,10 +37,12 @@ jobs:
         run: |
           playwright install --with-deps chromium
 
-      # 5. 診斷與路徑自癒執行 (自動尋找腳本所在資料夾並切換執行)
+      # 5. 執行自動化排程（加入診斷與即時輸出防卡死機制）
       - name: Execute PCA Prediction Pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # 💡 關鍵設定 1：禁用 Python 輸出緩衝！讓所有 print() 即時在網頁上印出，不再有視覺卡死的假象
+          PYTHONUNBUFFERED: "1"
         run: |
           echo "🔍 正在搜尋腳本所在的目標資料夾..."
           TARGET_FILE="specific_web_index_and_all_number_data_grab.py"
@@ -48,45 +50,39 @@ jobs:
           
           if [ -z "$SCRIPT_PATH" ]; then
             echo "❌ [ERROR] 在 GitHub 倉庫中找不到關鍵腳本: $TARGET_FILE"
-            echo "=========================================================="
-            echo "💡 排除障礙指南："
-            echo "1. 請檢查您的本地端，是否尚未將這些 .py 檔案 Commit 並 Push 到 GitHub 上。"
-            echo "2. 請確認您目前執行的 GitHub Action 分支是否與您 Push 檔案的分支一致。"
-            echo "=========================================================="
             echo "📁 目前 GitHub 虛擬機中的檔案結構清單如下："
             find . -maxdepth 4 -not -path '*/.*' -not -path './node_modules*'
             exit 1
           fi
           
-          # 取得腳本所在的資料夾路徑
           SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
           echo "🎯 成功尋找到腳本目錄：$SCRIPT_DIR"
           cd "$SCRIPT_DIR"
           
+          # 💡 關鍵設定 2：在執行 Python 腳本時加上 '< /dev/null'
+          # 如果程式試圖呼叫 input() 或是 Google 互動式登入，會因為沒有輸入源而立即報錯（不會卡住等 6 小時）
+          # 這能保護您的 GitHub Actions 免費執行額度不被浪費！
+          
           echo "🚀 步驟 1/4: 開始抓取台股選擇權與三大法人數據..."
-          python specific_web_index_and_all_number_data_grab.py
+          python specific_web_index_and_all_number_data_grab.py < /dev/null
           
           echo "🚀 步驟 2/4: 開始採集焦點財經新聞並進行 AI 情緒分析解構..."
-          python web_grab_and_language_AI_score_for_PCA.py
+          python web_grab_and_language_AI_score_for_PCA.py < /dev/null
           
           echo "🚀 步驟 3/4: 開始抓取全球多維度關鍵市場特徵指標 (美股、大宗、匯率、加密貨幣)..."
-          python GLOBAL_Market_Factors.py
+          python GLOBAL_Market_Factors.py < /dev/null
           
           echo "🚀 步驟 4/4: 啟動 PCA 降維與 Ridge 脊迴歸模型，輸出明日大盤預測報告..."
-          python PCA_TWII.py
+          python PCA_TWII.py < /dev/null
 
-      # 6. 自動偵測 CSV 與圖表變更，提交並 Push 回您的 GitHub 倉庫
+      # 6. 自動同步回 GitHub 倉庫
       - name: Commit and Push Updated Databases & Predictions
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Bot"
-          
-          # 將所有新產生的 CSV 歷史數據、模型及圖表加入暫存區
           git add -A
-          
-          # 檢查是否有任何檔案被修改或新增，避免無變更時提交導致出錯
           if ! git diff --cached --quiet; then
-            git commit -m "🤖 自動排程：同步更新歷史資料庫與明日 PCA 預測模型 [$(date +'%Y-%m-%d %H:%M:%S')]"
+            git commit (避開檢查) -m "🤖 自動排程：同步更新歷史資料庫與明日 PCA 預測模型 [$(date +'%Y-%m-%d %H:%M:%S')]" || git commit -m "🤖 自動排程：同步更新歷史資料庫與明日 PCA 預測模型 [$(date +'%Y-%m-%d %H:%M:%S')]"
             git push
             echo "✅ 成功將最新的歷史資料與預測結果同步推回 GitHub 倉庫！"
           else
