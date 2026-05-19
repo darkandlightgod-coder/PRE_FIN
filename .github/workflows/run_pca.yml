@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      # 3. 安裝必要套件 (包含 Google 雲端 API 系列套件)
+      # 3. 安裝必要套件
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
@@ -37,7 +37,30 @@ jobs:
         run: |
           playwright install --with-deps chromium
 
-      # 5. 執行自動化預測流水線 (串接 GitHub Secrets 變數)
+      # 5. 自適應目錄結構修復工程 (核心安全防護)
+      - name: Structure Autocure & File Migration
+        run: |
+          echo "🛠️ 啟動自適應目錄結構修復..."
+          
+          # 檢查是否有 Python 腳本被誤放到 .github/workflows/ 中
+          誤放腳本=$(find .github/workflows/ -maxdepth 1 -name "*.py")
+          
+          if [ ! -z "$誤放腳本" ]; then
+            echo "⚠️ 偵測到有 Python 腳本被放置在安全管制區 (.github/workflows/) 內！"
+            echo "🚀 正在將腳本自動安全移往『最外層根目錄』以符合安全規範..."
+            mv .github/workflows/*.py ./
+          fi
+          
+          # 清除可能產生在管制區底下的 data 快取，防止被 GitHub Security 阻擋
+          if [ -d ".github/workflows/data" ]; then
+            echo "🧹 清除管制區殘留之舊 data 快取目錄..."
+            rm -rf .github/workflows/data
+          fi
+          
+          echo "📁 目前最外層根目錄結構為："
+          ls -la
+
+      # 6. 執行自動化預測流水線 (在根目錄安全執行)
       - name: Execute PCA Prediction Pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -45,21 +68,6 @@ jobs:
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "🔍 正在搜尋腳本所在的目標資料夾..."
-          TARGET_FILE="specific_web_index_and_all_number_data_grab.py"
-          SCRIPT_PATH=$(find . -name "$TARGET_FILE" | head -n 1)
-          
-          if [ -z "$SCRIPT_PATH" ]; then
-            echo "❌ [ERROR] 在 GitHub 倉庫中找不到關鍵腳本: $TARGET_FILE"
-            echo "📁 目前 GitHub 虛擬機中的檔案結構清單如下："
-            find . -maxdepth 4 -not -path '*/.*' -not -path './node_modules*'
-            exit 1
-          fi
-          
-          SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
-          echo "🎯 成功尋找到腳本目錄：$SCRIPT_DIR"
-          cd "$SCRIPT_DIR"
-          
           echo "🚀 步驟 1/4: 開始抓取台股選擇權與三大法人數據..."
           python specific_web_index_and_all_number_data_grab.py < /dev/null
           
@@ -72,15 +80,24 @@ jobs:
           echo "🚀 步驟 4/4: 啟動 PCA 降維與 Ridge 脊迴歸模型，並進行嚴格雲端讀寫校驗..."
           python PCA_TWII.py < /dev/null
 
-      # 6. 自動同步回 GitHub 倉庫 (本地保險備份)
+      # 7. 自動將更新同步回 GitHub 倉庫 (此時 data/ 將留在根目錄，避開安全阻擋)
       - name: Commit and Push Updated Databases & Predictions
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Bot"
-          git add -A
+          
+          # 如果有被移到根目錄的 .py 檔案，一起納入追蹤
+          git add *.py
+          
+          # 強制清除對 .github/workflows/data 資料夾的 git 暫存追蹤
+          git rm -r --cached .github/workflows/data 2>/dev/null || true
+          
+          # 追蹤外層的資料庫更新
+          git add data/
+          
           if ! git diff --cached --quiet; then
-            git commit -m "Automated update: sync historical databases and next-day PCA predictions with cloud verification"
-            git push
+            git commit -m "Automated update: sync historical databases to root /data/ and next-day PCA predictions"
+            git push origin main
             echo "✅ 成功將最新的歷史資料與預測結果同步推回 GitHub 倉庫！"
           else
             echo "ℹ️ 資料庫內容無任何變動，跳過提交。"
