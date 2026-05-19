@@ -15,24 +15,28 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
 
-    steps:
-      # 1. 檢出倉庫代碼
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+    env:
+      # 強制所有 JS Action 直接使用 Node.js 24 執行環境，徹底阻斷 Deprecated 警告
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
-      # 2. 設定 Python 環境
+    steps:
+      # 1. 檢出倉庫代碼 (已升級至支援 Node.js 24 的原生 v6 版本)
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      # 2. 設定 Python 環境 (已升級至支援 Node.js 24 的原生 v6 版本)
       - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
 
-      # 3. 安裝必要套件 (包含 yfinance 以及所有 Google Sheets 與 Drive 的 API 依賴)
+      # 3. 安裝必要套件 (包含所有 Google API、機器學習、爬蟲與繪圖套件)
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy scikit-learn yfinance beautifulsoup4 requests snownlp vaderSentiment tabulate matplotlib nest_asyncio urllib3 gspread google-auth google-api-python-client
 
-      # 4. 自適應目錄結構修復工程 (自動將誤放到 .github 中的 .py 腳本移往根目錄)
+      # 4. 目錄結構自動校正 (自動將誤放到 .github 中的 .py 腳本安全移回根目錄)
       - name: Structure Autocure & File Migration
         run: |
           echo "🛠️ 啟動自適應目錄結構修復..."
@@ -52,7 +56,7 @@ jobs:
           echo "📁 目前最外層根目錄結構為："
           ls -la
 
-      # 5. 執行 7.0 旗艦版四步鏈接自動預測管線
+      # 5. 執行四步鏈接自動預測管線 (步驟 1~4 依序執行)
       - name: Execute PCA Prediction Pipeline
         env:
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
@@ -89,3 +93,19 @@ jobs:
           else
             echo "ℹ️ 資料庫內容無任何變動，跳過提交。"
           fi
+```
+eof
+
+---
+
+### 💡 您的 Google Drive 會基於哪一個 `.py` 檔案生成圖片？
+
+答案是：**`PCA_TWII.py`**（也就是整個分析管線的最後一步：**第 4 步的大腦程式**）。
+
+#### 🔍 這張圖片是如何在雲端產生的？運作機制解析：
+
+1. **本地繪製與存檔**：
+   在 `PCA_TWII.py` 執行過程中，Matplotlib 繪圖庫會讀取最新的 PCA 主成分分析結果（降維解釋度）與大盤多空預測軌跡（實際與預測回報率），並調用以下代碼將圖表繪製出來並暫存在 Runner 的虛擬主機中：
+   ```python
+   local_plot_path = "data/pca_diagnostics.png"
+   plt.savefig(local_plot_path, dpi=300)
