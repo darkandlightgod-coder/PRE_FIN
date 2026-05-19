@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-V12.0 PCA_Master_Exceed 雲端鋼鐵連線版
+V13.0 PCA_Master_Exceed 雲端強制鎖定版
 =========================================================
-1. 解決 Gspread 新舊版語法衝突，加入 robust_update()。
-2. 徹底解決 NaN 無法序列化上傳 Google Sheet 的問題。
-3. 圖檔上傳失敗的例外全面揭露，並確保本地備份。
-4. 恢復雲端 Sheet 的 Courier New 等寬字體格式化，讓競技戰報完美對齊。
-5. 強化 Google Auth 機制，支援多種環境變數與本地 credentials.json。
+1. 強制中斷機制 (Fail-Fast)：若無 Google 憑證，直接報錯並終止，拒絕「假成功」。
+2. 即時串流日誌 (Stream Print)：解決 GitHub Actions 緩衝區截斷超長字串的問題。
+3. 數學算式防禦：為 extract_math_form 加上 try-except 防護。
+4. 強效 JSON 淨化：清洗 inf 與 NaN，徹底消滅 Google Sheet 寫入崩潰。
 """
 
 import os
@@ -26,7 +25,7 @@ import math
 # 【1. 環境自建自癒系統 (Bootstrap)】
 # ==========================================
 def bootstrap():
-    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 V12.0 雲端連線增強版...")
+    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 V13.0 雲端強制鎖定版...")
     dependencies = {
         "pandas": "pandas", "numpy": "numpy", "yfinance": "yfinance", 
         "requests": "requests", "bs4": "beautifulsoup4", "playwright": "playwright",
@@ -46,7 +45,6 @@ def bootstrap():
 
     if installed_any:
         importlib.invalidate_caches()
-
     print("✅ 依賴套件配置完畢。\n")
 
 bootstrap()
@@ -86,7 +84,7 @@ CONFIG = {
 }
 
 # =====================================================================
-# 🔑 終極版 Google API 授權與雲端介接
+# 🔑 終極版 Google API 授權 (失敗直接中斷)
 # =====================================================================
 def get_google_clients():
     print("🔐 正在初始化 Google 雲端授權...")
@@ -101,9 +99,9 @@ def get_google_clients():
         try:
             creds_dict = json.loads(creds_json)
             credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-            print("   ✅ 成功讀取環境變數中的 JSON 憑證。")
+            print("   ✅ 成功從 GitHub Actions 環境變數讀取 JSON 憑證。")
         except Exception as e:
-            print(f"   ❌ 解析環境變數憑證失敗: {e}")
+            print(f"   ❌ 解析 JSON 憑證失敗: {e}")
     else:
         for key_file in ['credentials.json', 'google_credentials.json', 'client_secret.json']:
             if os.path.exists(key_file):
@@ -115,34 +113,40 @@ def get_google_clients():
                     pass
 
     if not credentials:
-        print("⚠️ 警告：完全無法獲取 Google 憑證，將以單機模式運行 (不會寫入 Sheet 與 Drive)。")
-        return None, None
+        print("\n🚨🚨🚨 致命錯誤：找不到 Google 雲端憑證 🚨🚨🚨")
+        print("原因：您的 GitHub Actions 腳本沒有成功把 Secrets 傳遞給 Python 程式。")
+        print("解決：請在 workflow (.yml) 檔案中，找到執行這個腳本的地方，確保加入了 env 區塊：")
+        print("      - name: 執行 Python 腳本")
+        print("        env:")
+        print("          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}")
+        print("          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}")
+        print("        run: python pca_master_exceed.py")
+        print("👉 為了避免「假成功」錯覺，程式將在此強制中斷 (Exit 1)。\n")
+        sys.exit(1)
 
     try:
         gc = gspread.authorize(credentials)
         drive_service = build('drive', 'v3', credentials=credentials)
-        print("✅ Google API 授權綁定成功！")
+        print("✅ Google API 授權綁定成功！準備連線。")
         return gc, drive_service
     except Exception as e:
         print(f"❌ Google 授權綁定崩潰: {e}")
-        return None, None
+        sys.exit(1)
 
 def get_or_create_sheet(gc, sheet_name):
     try:
-        sh = gc.open(sheet_name)
-        return sh
+        return gc.open(sheet_name)
     except gspread.exceptions.SpreadsheetNotFound:
         print(f"🆕 找不到 {sheet_name}，自動創建全新表單...")
         sh = gc.create(sheet_name)
-        print(f"   🔗 創建成功，新表單網址: {sh.url}")
+        print(f"   🔗 新表單網址: {sh.url}")
         return sh
 
 def robust_update(worksheet, range_name, data):
-    """強效無腦寫入器：相容所有新舊版 gspread 語法"""
     try:
-        worksheet.update(values=data, range_name=range_name) # gspread >= 6.0
+        worksheet.update(values=data, range_name=range_name) 
     except TypeError:
-        worksheet.update(range_name, data) # gspread < 6.0
+        worksheet.update(range_name, data) 
 
 # =====================================================================
 # 🕸️ 爬蟲引擎與資料庫同步
@@ -171,13 +175,8 @@ def update_master_dataset(gc):
     today = datetime.now()
     start_of_5yrs = today - timedelta(days=CONFIG["HISTORY_YEARS"] * 365)
     
-    sh = None
-    if gc:
-        sh = get_or_create_sheet(gc, CONFIG["SHEET_MASTER_DATA"])
-        records = sh.sheet1.get_all_records()
-        df_history = pd.DataFrame(records)
-    else:
-        df_history = pd.DataFrame()
+    sh = get_or_create_sheet(gc, CONFIG["SHEET_MASTER_DATA"])
+    df_history = pd.DataFrame(sh.sheet1.get_all_records())
 
     if not df_history.empty and "Date" in df_history.columns:
         last_date = datetime.strptime(df_history["Date"].max(), "%Y/%m/%d")
@@ -209,13 +208,13 @@ def update_master_dataset(gc):
     df_new["Sentiment"] = sentiments
     df_final = pd.concat([df_history, df_new]).drop_duplicates(subset=["Date"]).sort_values("Date")
     
-    if gc:
-        print(f"☁️ 正在將 {len(df_final)} 筆資料同步至 Google Sheet [{CONFIG['SHEET_MASTER_DATA']}]...")
-        df_clean = df_final.fillna("") # 致命殺手修復: 轉換 NaN 避免 JSON 崩潰
-        write_data = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
-        sh.sheet1.clear()
-        robust_update(sh.sheet1, "A1", write_data)
-        print("   ✅ 資料庫同步完成！")
+    print(f"☁️ 正在將 {len(df_final)} 筆資料同步至 Google Sheet [{CONFIG['SHEET_MASTER_DATA']}]...")
+    # 強效淨化：消滅 NaN 與 Infinity，防止 JSON 崩潰
+    df_clean = df_final.replace([np.inf, -np.inf], np.nan).fillna("") 
+    write_data = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
+    sh.sheet1.clear()
+    robust_update(sh.sheet1, "A1", write_data)
+    print("   ✅ 資料庫同步完成！")
         
     return df_final
 
@@ -224,30 +223,39 @@ def update_master_dataset(gc):
 # =====================================================================
 def extract_math_form(name, model, n_comps):
     pc_names = [f"PC{i+1}" for i in range(n_comps)]
-    if name == "線性 (Ridge)":
-        terms = [f"({c:+.4f})*{pc}" for c, pc in zip(model.coef_, pc_names) if abs(c) > 0.00001]
-        return f"Y = {model.intercept_:.4f} " + " ".join(terms)
-    elif name == "非線性乘算 (Poly Ridge)":
-        poly, ridge = model.named_steps['poly'], model.named_steps['ridge']
-        term_pairs = [(c, feat.replace(" ", "*")) for c, feat in zip(ridge.coef_, poly.get_feature_names_out(pc_names)) if abs(c) > 0.00001]
-        term_pairs.sort(key=lambda x: abs(x[0]), reverse=True)
-        terms = [f"({c:+.4f})*{feat}" for c, feat in term_pairs[:5]]
-        return f"Y = {ridge.intercept_:.4f} " + " ".join(terms) + (" ..." if len(term_pairs)>5 else "")
-    elif name in ["隨機森林 (Random Forest)", "梯度提升 (Gradient Boost)"]:
-        term_pairs = sorted([(imp, pc) for imp, pc in zip(model.feature_importances_, pc_names) if imp > 0.01], reverse=True)
-        return f"Y = TreeEnsemble(X) | 決策節點權重: " + ", ".join([f"{pc}({imp*100:.1f}%)" for imp, pc in term_pairs])
-    elif name == "支持向量機 (SVR)":
-        return f"Y = Σ α_i * exp(-γ||x_i - X||^2) {model.intercept_[0]:+.4f} | (支持向量數量: {len(model.support_)})"
+    try:
+        if name == "線性 (Ridge)":
+            terms = [f"({c:+.4f})*{pc}" for c, pc in zip(model.coef_, pc_names) if abs(c) > 0.00001]
+            return f"Y = {model.intercept_:.4f} " + " ".join(terms)
+        elif name == "非線性乘算 (Poly Ridge)":
+            poly, ridge = model.named_steps['poly'], model.named_steps['ridge']
+            term_pairs = [(c, feat.replace(" ", "*")) for c, feat in zip(ridge.coef_, poly.get_feature_names_out(pc_names)) if abs(c) > 0.00001]
+            term_pairs.sort(key=lambda x: abs(x[0]), reverse=True)
+            terms = [f"({c:+.4f})*[{feat}]" for c, feat in term_pairs[:5]]
+            return f"Y = {ridge.intercept_:.4f} " + " + ".join(terms) + (" ..." if len(term_pairs)>5 else "")
+        elif name in ["隨機森林 (Random Forest)", "梯度提升 (Gradient Boost)"]:
+            term_pairs = sorted([(imp, pc) for imp, pc in zip(model.feature_importances_, pc_names) if imp > 0.01], reverse=True)
+            return f"Y = TreeEnsemble(X) | 決策節點權重: " + ", ".join([f"{pc}({imp*100:.1f}%)" for imp, pc in term_pairs])
+        elif name == "支持向量機 (SVR)":
+            return f"Y = Σ α_i * exp(-γ||x_i - X||^2) {model.intercept_[0]:+.4f} | (支持向量數量: {len(model.support_)})"
+    except Exception as e:
+        return f"數學萃取異常: {e}"
     return "無法解析"
 
-def run_analytics_for_window(df, window_name, window_size, drive_service=None):
+def run_analytics_for_window(df, window_name, window_size, drive_service):
     sub_df = df.tail(window_size + 1).copy() if window_size else df.copy()
-    if len(sub_df) < 5: return f"\n[{window_name}] ⚠️ 樣本數過少，跳過運算。\n"
+    if len(sub_df) < 5: 
+        res = f"\n[{window_name}] ⚠️ 樣本數過少，跳過。\n"
+        print(res); sys.stdout.flush()
+        return res
 
     sub_df['TWII_Return'] = sub_df['TWII_Close'].pct_change().shift(-1)
     features = ["TWII_Close", "US10Y", "VIX", "SOX", "SPX", "Sentiment"]
     calc_df = sub_df.dropna(subset=features + ['TWII_Return'])
-    if len(calc_df) < 3: return f"\n[{window_name}] ⚠️ 清理後無有效數據。\n"
+    if len(calc_df) < 3: 
+        res = f"\n[{window_name}] ⚠️ 清理後無有效數據。\n"
+        print(res); sys.stdout.flush()
+        return res
 
     X, y = calc_df[features].values, calc_df['TWII_Return'].values
     scaler = StandardScaler()
@@ -280,16 +288,14 @@ def run_analytics_for_window(df, window_name, window_size, drive_service=None):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     ax1.scatter(X_pca[:, 0], X_pca[:, 1], c=y, cmap='RdYlGn', alpha=0.8, edgecolors='k')
     ax1.set_title(f"[{window_name}] PCA Feature Space")
-    
     names, scores = list(arena_results.keys()), [max(res["R2"], -1) for res in arena_results.values()]
     ax2.barh(names, scores, color=['#ff6b6b' if n == best_name else '#4ecdc4' for n in names])
     ax2.set_title(f"Model Arena R² Ranking\n🏆 Winner: {best_name}")
-    
     plt.tight_layout()
     img_name = f"pca_{window_name}.png"
     plt.savefig(img_name)
     plt.close()
-    print(f"   🖼️ 圖片 {img_name} 已儲存於本地。")
+    print(f"   🖼️ 圖片 {img_name} 已產生。")
 
     if drive_service:
         folder_id = CONFIG["DRIVE_FOLDER_ID"]
@@ -297,15 +303,15 @@ def run_analytics_for_window(df, window_name, window_size, drive_service=None):
             try:
                 media = MediaFileUpload(img_name, mimetype='image/png')
                 res = drive_service.files().create(body={'name': img_name, 'parents': [folder_id]}, media_body=media, fields='id').execute()
-                print(f"   ☁️ 圖片成功上傳 Google Drive! (ID: {res.get('id')})")
+                print(f"   ☁️ 圖片成功上傳 Drive! (ID: {res.get('id')})")
             except Exception as e:
-                print(f"   ❌ 圖片上傳 Google Drive 失敗: {e}")
+                print(f"   ❌ 圖片上傳 Drive 失敗: {e} (請確認 Service Account 有該資料夾編輯權限)")
         else:
-            print("   ⚠️ 未提供 GOOGLE_DRIVE_FOLDER_ID，跳過圖檔上傳。")
+            print("   ⚠️ 未提供 GOOGLE_DRIVE_FOLDER_ID，跳過圖檔上傳。圖片將隨 GitHub 容器銷毀。")
 
     summary = "\n".join([f"   [{n}]\n   ↳ R²準確率: {res['R2']:.4f} | 預期: {res['Prediction']*100:.2f}%\n   ↳ 數學: {res['Equation']}\n" for n, res in arena_results.items()])
     
-    return f"""
+    chunk = f"""
 ========================================
 🕒 維度: {window_name.upper()} (樣本數: {len(calc_df)})
 ========================================
@@ -318,50 +324,51 @@ def run_analytics_for_window(df, window_name, window_size, drive_service=None):
    - 最優模型 : {best_name} (準確率 R² {best_r2:.4f})
    - 綜合預期 : {winner_pred*100:.2f}% ({"🔴 偏空" if winner_pred < 0 else "🟢 偏多"})
 """
+    # 即時印出並強制刷新緩衝區，防止 GitHub 截斷日誌！
+    print(chunk)
+    sys.stdout.flush()
+    return chunk
 
 # =====================================================================
 # 🚀 執行主控台
 # =====================================================================
 def main():
     print("\n" + "="*50)
-    print("🚀 PCA_Master_Exceed V12.0 鋼鐵連線版")
+    print("🚀 PCA_Master_Exceed V13.0 雲端強制鎖定版")
     print("="*50)
+    sys.stdout.flush()
 
     gc, drive_service = get_google_clients()
     df = update_master_dataset(gc)
     
-    full_report = f"📊 V12.0 多模型競技與數學解析戰報 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    full_report = f"📊 V13.0 多模型競技與數學解析戰報 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     
     for w_name, w_size in CONFIG["WINDOWS"].items():
         print(f"\n🧠 正在對決與解剖維度: {w_name}...")
+        sys.stdout.flush()
         full_report += run_analytics_for_window(df, w_name, w_size, drive_service) + "\n"
 
-    print("\n" + full_report)
-
-    if gc:
+    try:
+        print(f"\n☁️ 準備將最終總戰報寫入 Google Sheet [{CONFIG['SHEET_REPORT']}]...")
+        sys.stdout.flush()
+        sh_report = get_or_create_sheet(gc, CONFIG["SHEET_REPORT"])
+        wks_rep = sh_report.sheet1
+        wks_rep.clear()
+        
+        matrix_data = [[line] for line in full_report.split('\n')]
+        robust_update(wks_rep, "A1", matrix_data)
+        print("   ✅ 戰報已成功寫入 Google Sheet！")
+        
         try:
-            print(f"☁️ 準備將戰報寫入 Google Sheet [{CONFIG['SHEET_REPORT']}]...")
-            sh_report = get_or_create_sheet(gc, CONFIG["SHEET_REPORT"])
-            wks_rep = sh_report.sheet1
-            wks_rep.clear()
+            wks_rep.format("A1:A200", {"textFormat": {"fontFamily": "Courier New", "fontSize": 10}})
+            wks_rep.format("A1", {"textFormat": {"fontFamily": "Courier New", "fontSize": 12, "bold": True}})
+            print("   ✅ 已套用 Courier New 戰報美化字體。")
+        except: pass
             
-            lines = full_report.split('\n')
-            matrix_data = [[line] for line in lines]
-            robust_update(wks_rep, "A1", matrix_data)
-            print("   ✅ 戰報已成功寫入 Google Sheet！")
-            
-            # 恢復美觀的 Courier New 等寬字體格式化
-            try:
-                wks_rep.format("A1:A200", {"textFormat": {"fontFamily": "Courier New", "fontSize": 10}})
-                wks_rep.format("A1", {"textFormat": {"fontFamily": "Courier New", "fontSize": 12, "bold": True}})
-                print("   ✅ 已套用 Courier New 戰報美化字體。")
-            except Exception as font_e:
-                print(f"   ⚠️ 字體格式化跳過 (不影響資料): {font_e}")
-                
-            print(f"🔗 戰報查閱網址: {sh_report.url}")
-        except Exception as e:
-            print(f"❌ 戰報寫入雲端遭遇致命錯誤:")
-            traceback.print_exc()
+        print(f"🔗 戰報查閱網址: {sh_report.url}")
+    except Exception as e:
+        print(f"❌ 戰報寫入雲端遭遇致命錯誤:")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
