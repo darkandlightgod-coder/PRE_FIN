@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-V10.0 - 模組 5: 多維度 PCA 預測大腦 (5種時間維度 + 非線性數學解析)
+V10.1 - 模組 5: 多維度 PCA 預測大腦 (5種時間維度 + 非線性數學解析 + 寫入 global_pca_features) (已更新12:58)
 功能: 
-1. 解析 CSV 檔案作為 YFinance 大量特徵白名單。
-2. 運算 5 種時間跨度 (3天, 7天, 1個月, 1年, 5年全資料)。
-3. PolynomialFeatures 非線性數學公式破解 (a*X1 + b*X2 + c*X1X2...)。
-4. 針對 14 個標的寫入專屬 Google Sheet。
+1. 運算 5 種時間跨度 (3天, 7天, 1個月, 1年, 5年全資料)。
+2. 非線性數學公式破解 (a*X1 + b*X2 + c*X1X2...)。
+3. 將全量資料 (alldata) 的 PCA 特徵矩陣寫出至 global_pca_features。
 """
 import os, sys, json, traceback, math
 import pandas as pd
@@ -29,7 +28,6 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def get_csv_tickers():
-    """解析目錄下所有 CSV 獲取真實台股清單"""
     files = ["所有上市公司.csv", "所有上櫃公司.csv", "所有興櫃公司.csv", "所有公開發行公司.csv", "所有創櫃公司.csv"]
     tickers = set(TARGETS)
     for f in files:
@@ -40,9 +38,9 @@ def get_csv_tickers():
                     for code in df["公司代號"].dropna():
                         if code.isdigit() and len(code) >= 4: tickers.add(f"{code}.TW")
             except: pass
-    return list(tickers)[:150] # 為避免 YFinance 記憶體爆掉，取樣 150 檔作為特徵矩陣
+    return list(tickers)[:150] # 避免記憶體爆掉，取樣 150 檔做特徵
 
-def run_pca_and_nonlinear_math(target, df, window_name, window_size):
+def run_pca_and_nonlinear_math(target, df, window_name, window_size, gc):
     if len(df) < window_size or target not in df.columns:
         return f"[{window_name}] ⚠️ 資料不足。\n"
         
@@ -56,16 +54,29 @@ def run_pca_and_nonlinear_math(target, df, window_name, window_size):
     
     if len(X) < 2: return f"[{window_name}] ⚠️ 樣本過少無法運算。\n"
     
-    # 1. 傳統 PCA
+    # PCA 運算
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    pca = PCA(n_components=min(5, X_scaled.shape[1], X_scaled.shape[0]))
+    pca = PCA(n_components=min(10, X_scaled.shape[1], X_scaled.shape[0])) # 提取前 10 個核心特徵
     X_pca = pca.fit_transform(X_scaled)
     
-    # 2. 非線性數學解析 (Polynomial Interaction Degree=2)
-    # 解構公式: Y = a*PC1 + b*PC2 + c*PC1^2 + d*PC1*PC2 + e*PC2^2
+    # 若為 'alldata' (全歷史區間)，且是計算第一個標的 (^TWII) 時，將 PCA 特徵匯出至 Google Sheet
+    if window_name == "alldata" and target == "^TWII" and gc:
+        print("   ➤ [alldata 模式] 擷取並匯出高維度 PCA 特徵至 global_pca_features...")
+        try:
+            wks_features = gc.open("global_pca_features").sheet1
+            pca_cols = [f"PC_{i+1}" for i in range(X_pca.shape[1])]
+            df_pca_export = pd.DataFrame(X_pca, columns=pca_cols).round(4)
+            df_pca_export.insert(0, "Date", df_w['Date'].values[1:])
+            wks_features.clear()
+            wks_features.update([df_pca_export.columns.values.tolist()] + df_pca_export.astype(str).values.tolist())
+            print("   ✅ global_pca_features 特徵矩陣寫入成功！")
+        except Exception as e:
+            print(f"   ❌ global_pca_features 寫入失敗: {e}")
+    
+    # 非線性數學解析 (Polynomial Degree 2)
     poly = PolynomialFeatures(degree=2, include_bias=False)
-    X_poly = poly.fit_transform(X_pca[:, :2]) # 取前兩個 PC 分析非線性
+    X_poly = poly.fit_transform(X_pca[:, :2])
     
     model = LinearRegression().fit(X_poly, Y)
     score = model.score(X_poly, Y)
@@ -81,7 +92,7 @@ def run_pca_and_nonlinear_math(target, df, window_name, window_size):
     report = f"🔍 區間: {window_name} (資料量: {len(X)})\n"
     report += f"   - 預期漲跌: {pred*100:.2f}%\n"
     report += f"   - 模型 R²: {score:.4f}\n"
-    report += f"   - 📐 非線性特徵解構數學式:\n     Return = {equation}\n"
+    report += f"   - 📐 非線性特徵數學式:\n     Return = {equation}\n"
     report += "-"*40 + "\n"
     return report
 
@@ -96,7 +107,7 @@ def get_sheet_name(target):
     return mapping.get(target, f"PRE_{target}")
 
 def main():
-    print("🧠 [模組 5] 啟動 V10.0 多維度預測大腦...")
+    print("🧠 [模組 5] 啟動 V10.1 多維度預測大腦...")
     try:
         tickers = get_csv_tickers()
         print(f"   ➤ 從 CSV 載入 {len(tickers)} 檔特徵矩陣，開始歷史爬取...")
@@ -115,9 +126,10 @@ def main():
         
         for target in TARGETS:
             print(f"🚀 正在分析標的: {target}")
-            full_report = f"📊 V10.0 神諭矩陣預測報告 - {target}\n"
+            full_report = f"📊 V10.1 神諭矩陣預測報告 - {target}\n"
             for w_name, w_size in TIMEFRAMES.items():
-                full_report += run_pca_and_nonlinear_math(target, df_master, w_name, w_size)
+                # 傳入 gc 給函數，讓其判斷是否要寫入 global_pca_features
+                full_report += run_pca_and_nonlinear_math(target, df_master, w_name, w_size, gc)
             
             if gc:
                 sheet_title = get_sheet_name(target)
