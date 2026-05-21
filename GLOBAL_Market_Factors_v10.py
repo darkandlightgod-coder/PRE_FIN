@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-V10.0 - 模組 1: 全球宏觀因子 (Global Market Factors)
-功能: 爬取過去 5 年的全球核心指數 (S&P500, VIX, 費半等)，寫入 global_market_factors。
+V10.1 - 模組 1: 全球宏觀因子 (Global Market Factors) (已更新12:58)
+功能: 爬取過去 5 年的全球核心指數，擴充【貴金屬】、【糧食】、【運價】期貨。
 """
 import yfinance as yf
 import pandas as pd
@@ -16,9 +16,15 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def main():
-    print("🌍 [模組 1] 啟動 V10.0 全球宏觀因子爬取 (5年歷史)...")
+    print("🌍 [模組 1] 啟動 V10.1 全球宏觀因子爬取 (包含原物料與運價)...")
     try:
-        factors = {"^GSPC": "SP500", "^VIX": "VIX", "^IXIC": "NASDAQ", "DX=F": "USD_Index", "GC=F": "Gold"}
+        # 擴充所有您要求的全球因子
+        factors = {
+            "^GSPC": "SP500", "^VIX": "VIX", "^IXIC": "NASDAQ", "DX=F": "USD_Index", 
+            "GC=F": "Gold", "SI=F": "Silver", "PL=F": "Platinum", "PA=F": "Palladium", "HG=F": "Copper", # 貴金屬
+            "CL=F": "Crude_Oil", "BDRY": "Freight_BDRY", # 原油與波羅的海乾散貨運價指標
+            "ZC=F": "Corn", "ZW=F": "Wheat", "ZS=F": "Soybean" # 糧食期貨
+        }
         df_list = []
         for symbol, name in factors.items():
             print(f"   ➤ 抓取 {name} ({symbol})...")
@@ -32,6 +38,9 @@ def main():
         if df_list:
             df_final = pd.concat(df_list, axis=1).ffill().bfill().reset_index()
             df_final['Date'] = df_final['Date'].dt.strftime('%Y-%m-%d')
+            # 數值四捨五入減少傳輸體積
+            for col in df_final.columns:
+                if col != 'Date': df_final[col] = df_final[col].round(4)
             
             gc = get_gspread_client()
             if gc:
@@ -39,9 +48,9 @@ def main():
                     wks = gc.open("global_market_factors").sheet1
                     wks.clear()
                     wks.update([df_final.columns.values.tolist()] + df_final.values.tolist())
-                    print("   ✅ 成功寫入 global_market_factors 試算表！")
+                    print("   ✅ 成功寫入 global_market_factors 試算表！(包含所有期貨與運價)")
                 except gspread.exceptions.SpreadsheetNotFound:
-                    print("   ❌ 找不到 'global_market_factors' 試算表，請在 Google Drive 手動建立空檔案！")
+                    print("   ❌ 找不到 'global_market_factors' 試算表！")
         print("✅ [模組 1] 完成！\n")
     except Exception as e:
         print(f"❌ [模組 1] 發生嚴重錯誤:\n{traceback.format_exc()}")
