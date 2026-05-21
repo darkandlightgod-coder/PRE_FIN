@@ -18,12 +18,11 @@ def get_gspread_client():
 def main():
     print("🌍 [模組 1] 啟動 V10.1 全球宏觀因子爬取 (包含原物料與運價)...")
     try:
-        # 擴充所有您要求的全球因子
         factors = {
             "^GSPC": "SP500", "^VIX": "VIX", "^IXIC": "NASDAQ", "DX=F": "USD_Index", 
-            "GC=F": "Gold", "SI=F": "Silver", "PL=F": "Platinum", "PA=F": "Palladium", "HG=F": "Copper", # 貴金屬
-            "CL=F": "Crude_Oil", "BDRY": "Freight_BDRY", # 原油與波羅的海乾散貨運價指標
-            "ZC=F": "Corn", "ZW=F": "Wheat", "ZS=F": "Soybean" # 糧食期貨
+            "GC=F": "Gold", "SI=F": "Silver", "PL=F": "Platinum", "PA=F": "Palladium", "HG=F": "Copper", 
+            "CL=F": "Crude_Oil", "BDRY": "Freight_BDRY", 
+            "ZC=F": "Corn", "ZW=F": "Wheat", "ZS=F": "Soybean" 
         }
         df_list = []
         for symbol, name in factors.items():
@@ -38,7 +37,6 @@ def main():
         if df_list:
             df_final = pd.concat(df_list, axis=1).ffill().bfill().reset_index()
             df_final['Date'] = df_final['Date'].dt.strftime('%Y-%m-%d')
-            # 數值四捨五入減少傳輸體積
             for col in df_final.columns:
                 if col != 'Date': df_final[col] = df_final[col].round(4)
             
