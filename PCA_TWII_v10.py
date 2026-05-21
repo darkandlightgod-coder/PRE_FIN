@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-V10.1 - 模組 5: 多維度 PCA 預測大腦 (5種時間維度 + 非線性數學解析 + 寫入 global_pca_features) (已更新12:58)
+V10.1 - 模組 5: 多維度 PCA 預測大腦 (已更新12:58)
 功能: 
-1. 運算 5 種時間跨度 (3天, 7天, 1個月, 1年, 5年全資料)。
-2. 非線性數學公式破解 (a*X1 + b*X2 + c*X1X2...)。
-3. 將全量資料 (alldata) 的 PCA 特徵矩陣寫出至 global_pca_features。
+1. 完美讀取 CSV 所有名單進行 PCA 特徵降維。
+2. 運算 5 種時間跨度 (3天, 7天, 1個月, 1年, 5年全資料)。
+3. 非線性數學公式破解。
+4. 匯出 global_pca_features 雲端報表。
 """
-import os, sys, json, traceback, math
+import os, sys, json, traceback, math, time
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -28,6 +29,7 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def get_csv_tickers():
+    """全面解析所有提供的 CSV 檔案"""
     files = ["所有上市公司.csv", "所有上櫃公司.csv", "所有興櫃公司.csv", "所有公開發行公司.csv", "所有創櫃公司.csv"]
     tickers = set(TARGETS)
     for f in files:
@@ -36,9 +38,11 @@ def get_csv_tickers():
                 df = pd.read_csv(f, dtype=str)
                 if "公司代號" in df.columns:
                     for code in df["公司代號"].dropna():
-                        if code.isdigit() and len(code) >= 4: tickers.add(f"{code}.TW")
+                        code_str = str(code).strip()
+                        if code_str.isdigit() and len(code_str) >= 4:
+                            tickers.add(f"{code_str}.TW")
             except: pass
-    return list(tickers)[:150] # 避免記憶體爆掉，取樣 150 檔做特徵
+    return list(tickers)
 
 def run_pca_and_nonlinear_math(target, df, window_name, window_size, gc):
     if len(df) < window_size or target not in df.columns:
@@ -54,13 +58,12 @@ def run_pca_and_nonlinear_math(target, df, window_name, window_size, gc):
     
     if len(X) < 2: return f"[{window_name}] ⚠️ 樣本過少無法運算。\n"
     
-    # PCA 運算
+    # 高維度 PCA 運算
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    pca = PCA(n_components=min(10, X_scaled.shape[1], X_scaled.shape[0])) # 提取前 10 個核心特徵
+    pca = PCA(n_components=min(10, X_scaled.shape[1], X_scaled.shape[0]))
     X_pca = pca.fit_transform(X_scaled)
     
-    # 若為 'alldata' (全歷史區間)，且是計算第一個標的 (^TWII) 時，將 PCA 特徵匯出至 Google Sheet
     if window_name == "alldata" and target == "^TWII" and gc:
         print("   ➤ [alldata 模式] 擷取並匯出高維度 PCA 特徵至 global_pca_features...")
         try:
@@ -74,7 +77,7 @@ def run_pca_and_nonlinear_math(target, df, window_name, window_size, gc):
         except Exception as e:
             print(f"   ❌ global_pca_features 寫入失敗: {e}")
     
-    # 非線性數學解析 (Polynomial Degree 2)
+    # 非線性數學解析
     poly = PolynomialFeatures(degree=2, include_bias=False)
     X_poly = poly.fit_transform(X_pca[:, :2])
     
@@ -89,7 +92,7 @@ def run_pca_and_nonlinear_math(target, df, window_name, window_size, gc):
     names = poly.get_feature_names_out(['PC1', 'PC2'])
     equation = " + ".join([f"({c:.4f} * {n})" for c, n in zip(coefs, names)])
     
-    report = f"🔍 區間: {window_name} (資料量: {len(X)})\n"
+    report = f"🔍 區間: {window_name} (資料量: {len(X)} | 使用矩陣特徵維度: {len(features)})\n"
     report += f"   - 預期漲跌: {pred*100:.2f}%\n"
     report += f"   - 模型 R²: {score:.4f}\n"
     report += f"   - 📐 非線性特徵數學式:\n     Return = {equation}\n"
@@ -110,15 +113,30 @@ def main():
     print("🧠 [模組 5] 啟動 V10.1 多維度預測大腦...")
     try:
         tickers = get_csv_tickers()
-        print(f"   ➤ 從 CSV 載入 {len(tickers)} 檔特徵矩陣，開始歷史爬取...")
-        df_yf = yf.download(tickers, period="5y", group_by="ticker", progress=False)
+        print(f"   ➤ 準備以 400 筆為批次，匯入 {len(tickers)} 檔特徵矩陣，防禦 YF 封鎖...")
         
         df_list = []
-        for t in tickers:
-            if t in df_yf and 'Close' in df_yf[t]:
-                s = df_yf[t]['Close'].dropna()
-                if not s.empty: df_list.append(s.rename(t))
-                
+        batch_size = 400
+        for i in range(0, len(tickers), batch_size):
+            chunk = tickers[i:i+batch_size]
+            try:
+                data = yf.download(chunk, period="5y", group_by="ticker", progress=False, threads=True)
+                for t in chunk:
+                    if len(chunk) == 1:
+                        if 'Close' in data: df_list.append(data['Close'].rename(t))
+                    else:
+                        if t in data and 'Close' in data[t]:
+                            s = data[t]['Close'].dropna()
+                            if not s.empty: df_list.append(s.rename(t))
+            except Exception as e:
+                print(f"   ⚠️ 發生阻擋，啟用容錯備用機制 ({e})")
+                break
+            time.sleep(1.5)
+            
+        if not df_list:
+            print("❌ 無法獲取任何特徵，中斷預測。")
+            return
+            
         df_master = pd.concat(df_list, axis=1).ffill().fillna(0).reset_index()
         df_master['Date'] = pd.to_datetime(df_master['Date']).dt.strftime('%Y-%m-%d')
         
@@ -128,7 +146,6 @@ def main():
             print(f"🚀 正在分析標的: {target}")
             full_report = f"📊 V10.1 神諭矩陣預測報告 - {target}\n"
             for w_name, w_size in TIMEFRAMES.items():
-                # 傳入 gc 給函數，讓其判斷是否要寫入 global_pca_features
                 full_report += run_pca_and_nonlinear_math(target, df_master, w_name, w_size, gc)
             
             if gc:
