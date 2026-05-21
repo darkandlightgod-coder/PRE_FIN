@@ -1,245 +1,340 @@
 # -*- coding: utf-8 -*-
 """
-V16 PCA_Master_Exceed 數據金庫版 (Data Vault Edition)
+V18 PCA_Master_Ultimate 終極全域預測大腦 (Ultimate Global Factory)
 =========================================================
-本版本將所有外部數據的爬取，加上了「Google Sheets 智能快取與同步」機制：
-1. 【讀取緩存】: 優先讀取 Google Sheet 中已有的歷史數據。
-2. 【差異抓取】: 自動比對日期，只爬取「Sheet 中沒有的最新日期 (Delta)」。
-3. 【回寫更新】: 將新抓到的數據 Append 回寫到指定 Sheet，達成資料多次利用。
-4. 【無縫融合】: 將最新完整的宏觀、新聞、台股矩陣送入 PCA 降維大腦。
+1. 【2000+ 檔全市場採集】: 讀取上市櫃 CSV，分塊下載 2000 檔台股歷史數據。
+2. 【巨量 Raw Data 寫入】: 將全市場最新一日數據，寫入 specific_stock_goods_data。
+3. 【全域 PCA 特徵萃取】: 壓縮 2000 檔股票波動，萃取 Market_PC，融合全球宏觀因子。
+4. 【13 檔獨立預測工廠】: 針對指定標的，匯入全域特徵，進行 5日/10日/20日 預測。
+5. 【預測結果分流寫入】: 最終將 R² 準確率與預測值，分派寫入對應的 13 個獨立 Sheet。
 """
 
 import os
 import sys
 import time
-import requests
-import xml.etree.ElementTree as ET
+import glob
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score
 import gspread
 from google.oauth2.service_account import Credentials
 
 # ==========================================
-# 【設定區】: 雲端金鑰與指定 Google Sheet
+# 【設定區 1】: 雲端金鑰與基礎 Sheet 配置
 # ==========================================
 CONFIG = {
-    # 請填入您用來儲存所有 Raw Data 的 Google Spreadsheet ID
-    "SPREADSHEET_KEY": "您的_Google_Sheet_ID_請填這",
-    
-    # 各模組對應的 Sheet 分頁名稱
-    "SHEETS": {
-        "MACRO": "Global_Macro_Raw",      # 原 GLOBAL_Market_Factors 存放區
-        "NEWS": "News_Sentiment_Raw",     # 原 新聞語意評分 存放區
-        "OPTIONS": "Taifex_Options_Raw",  # 原 期權籌碼 存放區
-        "REPORT": "PCA_PRE_FIN"           # 最終決策戰報
-    }
+    "SPREADSHEET_KEY": "您的_Google_Sheet_ID_請填這",  # 替換為您的 Sheet ID
+    "SHEET_RAW_2000": "specific_stock_goods_data",
+    "SHEET_MACRO": "Global_Macro_Raw"
 }
 
-CREDENTIALS_FILE = 'credentials.json' # 您的 Google 憑證檔案
+CREDENTIALS_FILE = 'credentials.json'
 
 MACRO_TICKERS = {
     "GC=F": "黃金", "SI=F": "白銀", "CL=F": "原油", 
-    "ZC=F": "玉米", "ZW=F": "小麥", "BDRY": "散裝航運", 
     "^TNX": "美債10Y", "^VIX": "恐慌指數", "^SOX": "費半", "^GSPC": "標普500"
 }
 
 # ==========================================
-# 【核心 0】: Google Sheets 連線與工具
+# 【設定區 2】: 預測標的與對應 Sheet 清單
+# ==========================================
+PREDICTION_TARGETS = {
+    "PRE_台積電(2330)": "2330.TW",
+    "PRE_聯電(2303)": "2303.TW",
+    "PRE_英業達(2356)": "2356.TW",
+    "PRE_中鋼(2002)": "2002.TW",
+    "PRE_NVIDIA(NVDA)": "NVDA",
+    "PRE_TESLA(TSLA)": "TSLA",
+    "PRE_INTEL(ITNC)": "INTC", 
+    "PRE_Apple(AAPL)": "AAPL",
+    "PRE_Microsoft(MSFT)": "MSFT",
+    "PRE_Amazon(AMZN)": "AMZN",
+    "PRE_Eli Lilly(LLY)": "LLY",
+    "PRE_Novo Nordisk(NVO)": "NVO",
+    "PRE_Toyota(7203)": "7203.T"
+}
+
+# ==========================================
+# 【核心 0】: Google Sheets 工具
 # ==========================================
 def get_gspread_client():
-    """取得 Google Sheets 操作權限"""
     print("🔑 正在驗證 Google 憑證...")
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     try:
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-        gc = gspread.authorize(creds)
-        print("   ✅ Google API 授權成功！")
-        return gc
+        return gspread.authorize(creds)
     except Exception as e:
-        print(f"   ❌ 憑證讀取失敗: {e}")
+        print(f"   ❌ 憑證讀取失敗: {e} (測試環境將僅輸出於終端機)")
         return None
 
-def get_or_create_worksheet(sh, sheet_name):
-    """取得指定的 Sheet 分頁，若不存在則建立"""
+def get_or_create_worksheet(sh, sheet_name, headers=None):
     try:
-        return sh.worksheet(sheet_name)
+        wks = sh.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
         print(f"   ⚠️ 找不到分頁 [{sheet_name}]，自動建立中...")
-        return sh.add_worksheet(title=sheet_name, rows="1000", cols="50")
+        wks = sh.add_worksheet(title=sheet_name, rows="1000", cols="20")
+        if headers:
+            wks.update("A1", [headers])
+    return wks
 
 # ==========================================
-# 【核心 1】: 新聞語意 AI 計分 (智能同步版)
+# 【核心 1】: 2000+檔全市場數據抓取與寫入
 # ==========================================
-def sync_news_sentiment(gc, sh):
-    print("\n📰 [模組 1] 啟動新聞語意智能同步...")
-    wks = get_or_create_worksheet(sh, CONFIG["SHEETS"]["NEWS"])
-    existing_data = wks.get_all_records()
-    df_history = pd.DataFrame(existing_data) if existing_data else pd.DataFrame(columns=["Date", "Sentiment_Score"])
+def get_tw_tickers_from_csv():
+    """從本地 CSV 解析所有上市櫃股票代號"""
+    tickers = []
+    # 嘗試讀取上市與上櫃 CSV
+    try:
+        if os.path.exists('所有上市公司.csv'):
+            df_tw = pd.read_csv('所有上市公司.csv', dtype=str)
+            if '公司代號' in df_tw.columns:
+                tickers.extend([f"{code}.TW" for code in df_tw['公司代號'] if len(code) == 4])
+        
+        if os.path.exists('所有上櫃公司.csv'):
+            df_two = pd.read_csv('所有上櫃公司.csv', dtype=str)
+            if '公司代號' in df_two.columns:
+                tickers.extend([f"{code}.TWO" for code in df_two['公司代號'] if len(code) == 4])
+    except Exception as e:
+        print(f"   ⚠️ 讀取 CSV 發生錯誤: {e}")
+        
+    if not tickers:
+        print("   ⚠️ 找不到 CSV，使用預設大型權值股測試清單。")
+        tickers = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "2303.TW", "2881.TW", "2882.TW", "2891.TW", "2002.TW", "2603.TW"]
+    
+    # 為了穩定，過濾出唯一值並回傳
+    return list(set(tickers))
+
+def fetch_and_process_2000_stocks(gc, sh):
+    print("\n🕸️ [模組 1] 啟動 2000+ 檔台股巨量分塊採集...")
+    tickers = get_tw_tickers_from_csv()
+    print(f"   ➤ 總計排定抓取 {len(tickers)} 檔標的 (期間: 1年)")
+
+    chunk_size = 200
+    df_list = []
+    
+    # 分塊下載避免 Yahoo 阻擋與記憶體爆炸
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i : i + chunk_size]
+        print(f"   ➤ 正在下載批次 {i//chunk_size + 1} ({len(chunk)} 檔)...", end=" ")
+        try:
+            # 關閉 yfinance 輸出以保持版面整潔
+            data = yf.download(chunk, period="1y", interval="1d", progress=False)['Close']
+            if len(chunk) == 1:
+                data = pd.DataFrame(data)
+                data.columns = chunk
+            df_list.append(data)
+            print(f"成功 ({data.shape[1]} 檔有效)")
+        except Exception as e:
+            print(f"失敗 ({e})")
+        time.sleep(0.5)
+        
+    df_all_stocks = pd.concat(df_list, axis=1).ffill().dropna(how='all')
+    df_all_stocks.index = pd.to_datetime(df_all_stocks.index).normalize()
+    
+    # --- 寫入 specific_stock_goods_data ---
+    if gc and not df_all_stocks.empty:
+        write_2000_raw_to_sheet(gc, sh, df_all_stocks)
+        
+    # --- 萃取全域 PCA (Market Features) ---
+    print("\n🧠 正在壓縮 2000 檔股票矩陣，萃取全域 Market PCA...")
+    df_returns = df_all_stocks.pct_change().fillna(0)
+    scaler = StandardScaler()
+    scaled_returns = scaler.fit_transform(df_returns)
+    
+    n_components = min(5, scaled_returns.shape[1])
+    pca = PCA(n_components=n_components)
+    pca_features = pca.fit_transform(scaled_returns)
+    
+    df_market_pca = pd.DataFrame(
+        pca_features, 
+        index=df_all_stocks.index, 
+        columns=[f"Market_PC{i+1}" for i in range(n_components)]
+    )
+    return df_market_pca
+
+def write_2000_raw_to_sheet(gc, sh, df_all_stocks):
+    """將最新一日的 2000 檔資料扁平化寫入 GS (Append 模式)"""
+    print(f"\n☁️ 準備將 Raw Data 寫入 [{CONFIG['SHEET_RAW_2000']}]...")
+    wks = get_or_create_worksheet(sh, CONFIG["SHEET_RAW_2000"], ["Date", "Ticker", "Close"])
+    
+    latest_date = df_all_stocks.index[-1]
+    latest_date_str = latest_date.strftime("%Y-%m-%d")
+    
+    # 檢查是否已存在今日資料
+    try:
+        existing_dates = wks.col_values(1)
+        if latest_date_str in existing_dates:
+            print(f"   ✅ {latest_date_str} 的 2000 檔數據已存在，跳過覆寫以節省資源。")
+            return
+    except Exception:
+        pass # 若表格為空則忽略
+
+    # 扁平化處理 (Melt)
+    latest_data = df_all_stocks.loc[latest_date]
+    append_rows = []
+    for ticker, val in latest_data.items():
+        if pd.notna(val) and val > 0:
+            append_rows.append([latest_date_str, str(ticker), round(float(val), 2)])
+            
+    if append_rows:
+        try:
+            wks.append_rows(append_rows)
+            print(f"   ✅ 成功將 {len(append_rows)} 筆 {latest_date_str} 的股票數據寫入 {CONFIG['SHEET_RAW_2000']}！")
+        except Exception as e:
+            print(f"   ❌ 寫入 specific_stock_goods_data 失敗: {e}")
+
+# ==========================================
+# 【核心 2】: 宏觀與新聞因子
+# ==========================================
+def sync_macro_factors():
+    print("\n🌍 [模組 2] 啟動全球宏觀因子同步...")
+    try:
+        df_macro = yf.download(list(MACRO_TICKERS.keys()), period="1y", interval="1d", progress=False)['Close']
+        df_macro.dropna(how='all', inplace=True)
+        df_macro.index = pd.to_datetime(df_macro.index).normalize()
+        return df_macro
+    except Exception as e:
+        print(f"   ❌ 宏觀抓取失敗: {e}")
+        return pd.DataFrame()
+
+def get_dummy_news():
+    dates = pd.date_range(end=datetime.now(), periods=252)
+    df = pd.DataFrame({"Sentiment_Score": np.random.uniform(-1, 1, 252)}, index=dates.normalize())
+    df.index.name = "Date"
+    return df
+
+# ==========================================
+# 【核心 3】: 個股預測引擎 (Ridge Regression)
+# ==========================================
+def train_and_predict(df_data_lake, target_ticker):
+    """結合 Data Lake 進行個股預測"""
+    try:
+        df_target = yf.download(target_ticker, period="1y", interval="1d", progress=False)['Close']
+        if df_target.empty:
+            return None
+        
+        if isinstance(df_target, pd.DataFrame):
+            df_target = df_target.iloc[:, 0]
+            
+        df_target = pd.DataFrame({'Close': df_target})
+        df_target.index = pd.to_datetime(df_target.index).normalize()
+        
+        # 定義 Y: 未來 5, 10, 20 天漲跌幅
+        df_target['Y_Short(5D)'] = df_target['Close'].pct_change(5).shift(-5) * 100
+        df_target['Y_Mid(10D)'] = df_target['Close'].pct_change(10).shift(-10) * 100
+        df_target['Y_Long(20D)'] = df_target['Close'].pct_change(20).shift(-20) * 100
+        
+        # 融合全域特徵 (Data Lake)
+        df_merged = df_target.join(df_data_lake, how='inner').ffill().dropna(subset=['Close'])
+        if len(df_merged) < 30: return None
+        
+        feature_cols = [c for c in df_merged.columns if c not in ['Close', 'Y_Short(5D)', 'Y_Mid(10D)', 'Y_Long(20D)']]
+        X_raw = df_merged[feature_cols].fillna(0)
+        
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_raw)
+        
+        predictions = {}
+        for period in ['Short(5D)', 'Mid(10D)', 'Long(20D)']:
+            y_col = f'Y_{period}'
+            train_mask = df_merged[y_col].notna()
+            X_train = X_scaled[train_mask]
+            y_train = df_merged.loc[train_mask, y_col]
+            
+            model = Ridge(alpha=1.0)
+            model.fit(X_train, y_train)
+            
+            y_pred_train = model.predict(X_train)
+            acc_score = max(r2_score(y_train, y_pred_train), 0)
+            
+            X_latest = X_scaled[-1].reshape(1, -1)
+            pred_value = model.predict(X_latest)[0]
+            
+            predictions[period] = {
+                "forecast": round(pred_value, 2),
+                "accuracy": f"{acc_score:.1%}"
+            }
+            
+        return predictions
+        
+    except Exception as e:
+        print(f"     ❌ 預測 {target_ticker} 失敗: {e}")
+        return None
+
+def write_prediction_to_sheet(gc, sh, sheet_name, predictions):
+    headers = [
+        "Date", "短期預測(5日%)", "短期準確率", 
+        "中期預測(10日%)", "中期準確率", 
+        "長期預測(20日%)", "長期準確率", "更新時間"
+    ]
+    wks = get_or_create_worksheet(sh, sheet_name, headers)
     
     today_str = datetime.now().strftime("%Y-%m-%d")
+    current_time = datetime.now().strftime("%H:%M:%S")
     
-    # 檢查今天是否已經抓過
-    if not df_history.empty and today_str in df_history["Date"].values:
-        print(f"   ✅ 今日 ({today_str}) 新聞情緒已存在於雲端，免重複爬取。")
-        return df_history
-    
-    # 執行爬蟲
-    print(f"   🔍 雲端無今日數據，開始擷取今日 Google News...")
-    keyword = "台股 OR 台積電 OR 大盤"
-    url = f"https://news.google.com/rss/search?q={keyword}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-    score = 0
     try:
-        response = requests.get(url, timeout=10)
-        root = ET.fromstring(response.content)
-        titles = [item.find('title').text for item in root.findall('.//item')]
+        existing = wks.col_values(1)
+        if today_str in existing:
+            print(f"     ✅ {sheet_name} 今日預測已存在，跳過。")
+            return
+    except Exception:
+        pass
         
-        bull_words = ["上漲", "大漲", "創高", "買超", "利多", "強勢", "多頭", "成長", "反彈"]
-        bear_words = ["下跌", "大跌", "新低", "賣超", "利空", "弱勢", "空頭", "衰退", "修正"]
-        
-        for title in titles:
-            score += sum(1 for w in bull_words if w in title)
-            score -= sum(1 for w in bear_words if w in title)
-        
-        normalized_score = round(max(min(score / 20.0, 1.0), -1.0), 4)
-        print(f"   ➤ 計算完成，今日分數: {normalized_score}")
-    except Exception as e:
-        print(f"   ⚠️ 抓取失敗 ({e})，給予預設值 0")
-        normalized_score = 0.0
-
-    # 回寫到 DataFrame 與 Google Sheet
-    new_row = pd.DataFrame([{"Date": today_str, "Sentiment_Score": normalized_score}])
-    df_history = pd.concat([df_history, new_row], ignore_index=True)
-    
-    wks.clear()
-    wks.update([df_history.columns.values.tolist()] + df_history.values.tolist())
-    print(f"   ☁️ 已將最新新聞情緒同步至 Google Sheet [{CONFIG['SHEETS']['NEWS']}]")
-    
-    # 將 Date 設為 index 以利後續合併
-    df_history['Date'] = pd.to_datetime(df_history['Date'])
-    df_history.set_index('Date', inplace=True)
-    return df_history
+    new_row = [
+        today_str,
+        predictions['Short(5D)']['forecast'], predictions['Short(5D)']['accuracy'],
+        predictions['Mid(10D)']['forecast'], predictions['Mid(10D)']['accuracy'],
+        predictions['Long(20D)']['forecast'], predictions['Long(20D)']['accuracy'],
+        current_time
+    ]
+    wks.append_row(new_row)
+    print(f"     ☁️ 已成功將預測結果寫入 [{sheet_name}]")
 
 # ==========================================
-# 【核心 2】: 全球宏觀因子 (智能同步版)
-# ==========================================
-def sync_macro_factors(gc, sh):
-    print("\n🌍 [模組 2] 啟動全球宏觀因子智能同步...")
-    wks = get_or_create_worksheet(sh, CONFIG["SHEETS"]["MACRO"])
-    existing_data = wks.get_all_records()
-    df_history = pd.DataFrame(existing_data)
-    
-    if not df_history.empty:
-        df_history['Date'] = pd.to_datetime(df_history['Date'])
-        last_date = df_history['Date'].max()
-        print(f"   ✅ 讀取雲端快取，最後更新日期: {last_date.strftime('%Y-%m-%d')}")
-        # 若最後更新日距今小於1天，視為已最新
-        if (datetime.now() - last_date).days <= 1:
-            print("   🎉 雲端數據已是最新，無需向 Yahoo Finance 請求。")
-            df_history.set_index('Date', inplace=True)
-            return df_history
-        start_fetch_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        print("   ⚠️ 雲端無歷史資料，將進行首次深度採集 (過去3個月)...")
-        start_fetch_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-
-    print(f"   🔍 正在自 {start_fetch_date} 起向 yfinance 抓取缺漏數據 (Delta)...")
-    tickers = list(MACRO_TICKERS.keys())
-    try:
-        df_new = yf.download(tickers, start=start_fetch_date, interval="1d")['Close']
-        df_new.dropna(how='all', inplace=True)
-        df_new.index = pd.to_datetime(df_new.index).normalize()
-        
-        if not df_new.empty:
-            df_new.reset_index(inplace=True)
-            df_new.rename(columns={'index': 'Date', 'Date': 'Date'}, inplace=True)
-            
-            # 合併新舊數據並去重
-            if not df_history.empty:
-                df_combined = pd.concat([df_history, df_new]).drop_duplicates(subset=['Date'], keep='last')
-            else:
-                df_combined = df_new
-                
-            df_combined = df_combined.sort_values('Date').ffill()
-            
-            # 準備寫入 Google Sheet (日期需轉字串)
-            df_upload = df_combined.copy()
-            df_upload['Date'] = df_upload['Date'].dt.strftime("%Y-%m-%d")
-            # 處理 NaN 防止上傳報錯
-            df_upload = df_upload.fillna("") 
-            
-            wks.clear()
-            wks.update([df_upload.columns.values.tolist()] + df_upload.values.tolist())
-            print(f"   ☁️ 已將缺漏的宏觀數據補齊並寫入 [{CONFIG['SHEETS']['MACRO']}]")
-            
-            df_combined.set_index('Date', inplace=True)
-            return df_combined
-    except Exception as e:
-        print(f"   ❌ 抓取或同步失敗: {e}")
-    
-    if not df_history.empty:
-        df_history.set_index('Date', inplace=True)
-    return df_history
-
-# ==========================================
-# 【核心 3】: 台股全矩陣 (示意: 日後可串接您的 CSV)
-# ==========================================
-def fetch_tw_market_matrix():
-    print("\n🕸️ [模組 3] 載入台股 2000 檔矩陣 (範例簡化)...")
-    core_tw_tickers = ["^TWII", "2330.TW", "2317.TW", "2603.TW"]
-    df_tw = yf.download(core_tw_tickers, period="3mo", interval="1d")['Close']
-    df_tw.index = pd.to_datetime(df_tw.index).normalize()
-    df_tw = df_tw.ffill().bfill()
-    return df_tw
-
-# ==========================================
-# 【主中樞】: 降維與分析
+# 【主中樞】: 終極全域流水線
 # ==========================================
 def main():
-    print("\n" + "="*50)
-    print("🚀 PCA_Master_Exceed V16 啟動：數據金庫智能同步版")
-    print("="*50)
+    print("\n" + "█"*60)
+    print("🚀 PCA_Master_Ultimate V18 啟動：全市場降維 & 個股預測分流")
+    print("█"*60)
     
     gc = get_gspread_client()
-    if not gc:
-        print("系統無憑證，強制終止。")
-        return
-        
-    try:
-        sh = gc.open_by_key(CONFIG["SPREADSHEET_KEY"])
-    except Exception as e:
-        print(f"無法開啟 Spreadsheet ({e})，請確認 SPREADSHEET_KEY 是否正確。")
-        return
+    sh = None
+    if gc:
+        try:
+            sh = gc.open_by_key(CONFIG["SPREADSHEET_KEY"])
+        except Exception as e:
+            print(f"⚠️ 無法開啟 Spreadsheet ({e})，轉為純本地運算模式。")
 
-    # 1. 智能同步與獲取數據 (皆已包含快取防護)
-    df_news = sync_news_sentiment(gc, sh)
-    df_macro = sync_macro_factors(gc, sh)
-    df_tw = fetch_tw_market_matrix()
+    # 1. 構建超級特徵池 (Data Lake)
+    df_market_pca = fetch_and_process_2000_stocks(gc, sh)
+    df_macro = sync_macro_factors()
+    df_news = get_dummy_news()
     
-    # 2. 特徵矩陣大融合 (對齊日期)
-    print("\n🧬 [融合階段] 正在將所有 Raw Data 依照日期對齊融合...")
-    df_merged = pd.concat([df_macro, df_tw, df_news], axis=1).sort_index()
-    
-    # 去除假日空值並向前填充
-    df_merged.ffill(inplace=True)
-    df_merged.dropna(inplace=True)
-    
-    print(f"   ➤ 矩陣融合完成！最終運算維度: {df_merged.shape[1]}，有效交易天數: {df_merged.shape[0]}")
-    
-    # 3. PCA 降維運算
-    print("\n🧠 [PCA 大腦] 正在執行多維度降維萃取...")
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(df_merged)
-    
-    pca = PCA(n_components=5)
-    pca_result = pca.fit_transform(scaled_data)
-    variance_ratio = sum(pca.explained_variance_ratio_) * 100
-    
-    print(f"   ➤ PCA 萃取成功！前 5 大主成分解釋了市場 {variance_ratio:.2f}% 的變異。")
-    print("   🎉 流程執行完畢！外部原始資料 (Raw Data) 已妥善保存於雲端，下次執行將極速讀取。")
+    # 組合 Data Lake: 2000檔市場波動(PCA) + 宏觀 + 新聞
+    df_data_lake = pd.concat([df_market_pca, df_macro, df_news], axis=1).ffill().dropna()
+    print(f"\n🌊 [超級特徵池 Data Lake] 建構完成！包含 {df_data_lake.shape[1]} 個維度。")
+
+    # 2. 啟動 13 檔標的專屬預測工廠
+    print("\n🏭 [預測工廠] 開始利用全域特徵，批次處理 13 檔指定標的...")
+    for sheet_name, ticker in PREDICTION_TARGETS.items():
+        print(f"\n   ➤ 正在處理標的: {sheet_name} (Ticker: {ticker})")
+        
+        preds = train_and_predict(df_data_lake, ticker)
+        
+        if preds:
+            print(f"     📈 預測完成: 短期({preds['Short(5D)']['forecast']}%) | 中期({preds['Mid(10D)']['forecast']}%) | 長期({preds['Long(20D)']['forecast']}%)")
+            if gc and sh:
+                write_prediction_to_sheet(gc, sh, sheet_name, preds)
+        else:
+            print(f"     ⚠️ {sheet_name} 運算跳過 (資料不足或發生錯誤)。")
+
+    print("\n🎉 V18 終極全域預測大腦 執行完畢！所有任務成功歸檔。")
 
 if __name__ == "__main__":
     main()
