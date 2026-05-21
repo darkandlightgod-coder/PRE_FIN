@@ -14,6 +14,7 @@ import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 import time
+import json
 
 # ==========================================
 # 【1. 設定與工具】
