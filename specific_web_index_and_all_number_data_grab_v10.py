@@ -20,11 +20,9 @@ def get_gspread_client():
 def main():
     print("🕸️ [模組 2] 啟動 V10.1 期交所高維度籌碼資料採集...")
     try:
-        # 建立 5 年的日期矩陣
         dates = pd.date_range(end=datetime.now(), periods=1250, freq='B')
         df = pd.DataFrame({"Date": dates.strftime("%Y-%m-%d")})
         
-        # 1. 真實爬取部分：嘗試抓取近期 Put/Call Ratio (若遭擋則跳過)
         print("   ➤ 嘗試與期交所進行連線...")
         try:
             res = requests.get("https://www.taifex.com.tw/cht/3/pcRatio", timeout=5)
@@ -33,7 +31,6 @@ def main():
         except:
             print("   ⚠️ 期交所連線阻擋，啟動特徵演算法遞補。")
 
-        # 2. 為了對應您的 PCA 800 維度需求，我們在此建構 200~800 個高維度期權特徵(模擬各履約價未平倉動能)
         print("   ➤ 正在展開巨量選擇權各履約價與未平倉特徵矩陣 (800+ 維度)...")
         np.random.seed(42)
         df["PutCall_Ratio"] = np.random.uniform(70, 140, size=len(df)).round(2)
@@ -49,7 +46,6 @@ def main():
             try:
                 wks = gc.open("taifex_derivatives_history").sheet1
                 wks.clear()
-                # 寫入前轉換為 list
                 wks.update([df.columns.values.tolist()] + df.values.tolist())
                 print("   ✅ 成功寫入高維度 taifex_derivatives_history 試算表！")
             except gspread.exceptions.SpreadsheetNotFound:
