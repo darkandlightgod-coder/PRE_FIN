@@ -1,31 +1,53 @@
-name: V10.0 Oracle Matrix Pipeline
+name: V10.0 5-in-1 PCA Master Pipeline
 
 on:
   schedule:
-    - cron: '0 10 * * 1-5' # 每週一到五 UTC 10:00 執行
-  workflow_dispatch:
+    - cron: '0 8 * * 1-5' # 每週一到五 UTC 8:00 (台灣下午 4:00) 執行
+  workflow_dispatch: # 支援手動觸發
 
 jobs:
-  build:
+  run-pipeline:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pandas numpy yfinance requests scikit-learn gspread google-auth playwright
-        playwright install chromium
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy yfinance requests scikit-learn matplotlib gspread google-auth
 
-    - name: Execute Oracle Matrix Master
-      env:
-        GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-        GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-      run: |
-        python pca_master_exceed_v10.py
+      - name: 1. specific_web_index_and_all_number_data_grab
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: python specific_web_index_and_all_number_data_grab.py
+
+      - name: 2. web_grab_and_language_AI_score_for_PCA
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: python web_grab_and_language_AI_score_for_PCA.py
+
+      - name: 3. GLOBAL_Market_Factors
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: python GLOBAL_Market_Factors.py
+
+      - name: 4. PCA_TWII (5-Window Non-Linear Optimization)
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: python PCA_TWII.py
+
+      - name: 5. pca_master (Final Reporter)
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: python pca_master.py
