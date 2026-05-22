@@ -1,12 +1,10 @@
-name: V10.0 Independent PCA Pipeline
+name: Debug Write Test
 
 on:
-  schedule:
-    - cron: '0 8 * * 1-5' # 每週一到五 UTC 8:00
-  workflow_dispatch:
+  workflow_dispatch: # 允許在 GitHub 網頁上手動按按鈕執行
 
 jobs:
-  run-pipeline:
+  run-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -20,34 +18,10 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy yfinance requests scikit-learn matplotlib gspread google-auth urllib3
+          pip install pandas numpy yfinance gspread google-auth
 
-      - name: 1. GLOBAL_Market_Factors
+      - name: Run Diagnostic Test
         env:
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-        run: python GLOBAL_Market_Factors.py
-
-      - name: 2. specific_web_index_and_all_number_data_grab
-        env:
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-        run: python specific_web_index_and_all_number_data_grab.py
-
-      - name: 3. web_grab_and_language_AI_score_for_PCA
-        env:
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-        run: python web_grab_and_language_AI_score_for_PCA.py
-
-      - name: 4. PCA_TWII (Polynomial Features)
-        env:
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-        run: python PCA_TWII.py
-
-      - name: 5. pca_master
-        env:
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-        run: python pca_master.py
+        run: python test.py
