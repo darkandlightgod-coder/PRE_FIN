@@ -14,6 +14,7 @@ def get_gspread_client():
 def safe_gspread_write(gc, file_name, df):
     """【獨立檔案寫入邏輯】：依據檔名開啟獨立的 Google Sheet 檔案"""
     try:
+        time.sleep(2) # ⚠️ 加入防禦性延遲，避免瞬間請求過多被 Google API 封鎖
         sh = gc.open(file_name)
         wks = sh.sheet1 # 永遠寫入該檔案的第一個預設分頁
         if df.empty: return
@@ -45,9 +46,11 @@ def main():
     print("🌍 啟動國際宏觀因子採集")
     try:
         gc = get_gspread_client()
-        tickers = {"^TWII": "TWII", "GC=F": "Gold", "^TNX": "US10Y", "^VIX": "VIX", "^SOX": "SOX", "^GSPC": "SP500"}
+        # ⚠️ 這裡將 GC=F 替換為 GLD (SPDR 黃金 ETF)，避免 Yahoo Finance 報錯
+        tickers = {"^TWII": "TWII", "GLD": "Gold", "^TNX": "US10Y", "^VIX": "VIX", "^SOX": "SOX", "^GSPC": "SP500"}
         start_date = (datetime.now() - timedelta(days=5*365)).strftime("%Y-%m-%d")
         
+        print("⏳ 正在從 Yahoo Finance 獲取數據...")
         data = yf.download(list(tickers.keys()), start=start_date, progress=False)
         df_macro = data['Close'] if isinstance(data.columns, pd.MultiIndex) else data
         df_macro.rename(columns=tickers, inplace=True)
