@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-V12.0 web_grab_and_language_AI_score_for_PCA.py
+V13.0 web_grab_and_language_AI_score_for_PCA.py
 純 Python 字典計分版 (無依賴外部 AI API，無限次執行)
 特色:
-1. 支援多個目標關鍵字，每個關鍵字獨立產出一欄 (例如：台指期_AI_SCORE, 費半_AI_SCORE)。
-2. 嚴格綁定 Google Sheet ID，拔除所有自動建表功能，杜絕誤創檔案。
-3. 採用字典權重法，運算極快，不消耗任何 API 額度。
+1. 嚴格綁定 Google Sheet ID，杜絕誤創檔案。
+2. 強制寫入並對齊所有欄位名稱 (關鍵字_AI_SCORE)，適合 PCA 特徵工程。
+3. 採用全覆寫同步(Full-Sync)模式，自動處理空表與欄位變更。
 """
 import os, sys, json, time, random, traceback
 import urllib.parse
@@ -26,9 +26,9 @@ CONFIG = {
     "SPREADSHEET_ID": "1ZVmajxud7D4uRim8qKPRM4bA_TjnZOxvaZsWja3FKeM",
     "TARGET_SHEET_NAME": "stock_history_AI_SCORE",
     
-    # 您想追蹤的各種關鍵字陣列，可以自由新增或刪除
+    # 追蹤的關鍵字陣列 (未來可隨時新增，系統會自動擴充欄位)
     "KEYWORDS_TO_CRAWL": ["台股", "台指期", "費半", "那斯達克", "台積電"],
-    "LOOKBACK_DAYS": 30, # 回溯天數
+    "LOOKBACK_DAYS": 30, 
     
     # 情緒字詞與權重
     "BULLISH_WORDS": {
@@ -44,7 +44,7 @@ CONFIG = {
 }
 
 # ==========================================
-# 2. Google Sheet 認證與寫入 (嚴格模式)
+# 2. Google Sheet 認證與完美合併寫入
 # ==========================================
 def get_gspread_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -54,41 +54,60 @@ def get_gspread_client():
         raise ValueError("Missing GSPREAD_CREDENTIALS")
     return gspread.authorize(Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes))
 
-def safe_gspread_write(gc, spreadsheet_id, sheet_name, df):
+def safe_gspread_write(gc, spreadsheet_id, sheet_name, df_new):
     print(f"嘗試開啟指定的試算表 ID: {spreadsheet_id}")
     try:
-        # 嚴格開啟指定 ID，不允許去抓其他表
-        spreadsheet = gc.open_by_key(spreadsheet_id)
-        wks = spreadsheet.worksheet(sheet_name)
+        wks = gc.open_by_key(spreadsheet_id).worksheet(sheet_name)
     except WorksheetNotFound:
-        # 完全不執行自動建立，直接擋下來並報錯
-        print(f"❌ 嚴格模式阻擋：在指定的試算表中找不到分頁 [{sheet_name}]。")
-        print("請確認您已經在該 Google Sheet 裡面手動建立好這個分頁，程式拒絕自動創建。")
+        print(f"❌ 嚴格模式阻擋：找不到分頁 [{sheet_name}]，請手動建立。")
         return
     except Exception as e:
-        print(f"❌ 開啟試算表失敗，可能是權限問題，請確認 Service Account ({e})")
+        print(f"❌ 開啟試算表失敗: {e}")
         return
         
     try:
-        # 清理 dataframe 以符合 GSheet 格式
-        df_clean = df.copy()
-        df_clean = df_clean.astype(str).replace({"nan": "", "NaN": "", "NaT": ""})
+        # 取得雲端現有資料
+        existing_vals = wks.get_all_values()
         
-        existing = wks.get_all_values()
-        
-        if not existing:
-            # 初始化：寫入標題列與所有資料
-            wks.update([df_clean.columns.tolist()] + df_clean.values.tolist())
-            print(f"🟢 [{sheet_name}] 初始化寫入完成。")
+        # 判斷雲端資料是否包含有效的標題列 ('Date')
+        if existing_vals and len(existing_vals) > 0 and 'Date' in existing_vals[0]:
+            headers = existing_vals[0]
+            df_existing = pd.DataFrame(existing_vals[1:], columns=headers)
         else:
-            # 追加：比對日期，只寫入新資料
-            existing_dates = set([str(row[0]) for row in existing[1:] if row])
-            df_new = df_clean[~df_clean['Date'].astype(str).isin(existing_dates)]
-            if not df_new.empty: 
-                wks.append_rows(df_new.values.tolist())
-                print(f"🟢 [{sheet_name}] 成功追加 {len(df_new)} 筆新日期資料。")
-            else:
-                print(f"⚡ [{sheet_name}] 語意分數已是最新，無需更新。")
+            # 如果全是空白或是沒有標題，當作全新表格處理
+            df_existing = pd.DataFrame()
+
+        # 將雲端資料與新抓取的資料進行完美合併
+        if not df_existing.empty:
+            df_existing['Date'] = pd.to_datetime(df_existing['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+            df_final = pd.concat([df_existing, df_new], ignore_index=True)
+            # 若日期重複，保留最新抓取的資料
+            df_final = df_final.drop_duplicates(subset=['Date'], keep='last')
+        else:
+            df_final = df_new.copy()
+
+        # 依日期排序，處理缺失值 (如新增關鍵字產生的空缺一律補 0)
+        df_final['Date'] = pd.to_datetime(df_final['Date'])
+        df_final = df_final.sort_values("Date")
+        df_final['Date'] = df_final['Date'].dt.strftime('%Y-%m-%d')
+        df_final = df_final.fillna(0)
+
+        # 轉換格式並準備寫入矩陣 (第一列強制放入 columns)
+        df_final_clean = df_final.astype(str).replace({"nan": "0", "NaN": "0", "NaT": ""})
+        write_data = [df_final_clean.columns.tolist()] + df_final_clean.values.tolist()
+        
+        # 清空工作表並一次性完整更新
+        wks.clear()
+        
+        # 兼容不同版本的 gspread API 語法
+        try:
+            wks.update(range_name="A1", values=write_data)
+        except TypeError:
+            wks.update("A1", write_data)
+            
+        print(f"🟢 [{sheet_name}] 更新成功！第一列已確保為完整的欄位名稱。")
+        print(f"📊 目前共有 {len(df_final_clean)} 天的特徵矩陣。")
+        
     except Exception:
         print(f"❌ 寫入 {sheet_name} 時發生非預期的錯誤:")
         print(traceback.format_exc())
@@ -104,7 +123,7 @@ def fetch_sentiment_for_keyword(keyword):
     for i in range(CONFIG['LOOKBACK_DAYS']):
         d = base_date - timedelta(days=i)
         if d.weekday() >= 5: 
-            continue # 跳過週末
+            continue 
             
         d_str = d.strftime("%Y-%m-%d")
         url = f"https://news.google.com/rss/search?q={urllib.parse.quote(keyword)}+after:{d_str}+before:{(d+timedelta(days=1)).strftime('%Y-%m-%d')}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
@@ -121,48 +140,36 @@ def fetch_sentiment_for_keyword(keyword):
                     bull_score = sum(weight for word, weight in CONFIG['BULLISH_WORDS'].items() if word in t)
                     bear_score = sum(weight for word, weight in CONFIG['BEARISH_WORDS'].items() if word in t)
                     total_weight += (bull_score - bear_score)
-                
-                # 計算平均並保留 4 位小數
                 daily_score = round(total_weight / max(len(titles), 1), 4)
-                
-        except Exception as e:
-            # 發生錯誤時給予微小雜訊，避免產生極端空值
+        except Exception:
             daily_score = round(np.random.normal(0, 0.05), 4) 
             
-        # 欄位名稱自動依照規則命名
         scores.append({"Date": d_str, f"{keyword}_AI_SCORE": daily_score})
+        time.sleep(random.uniform(0.5, 1.5)) 
         
-        time.sleep(random.uniform(0.5, 1.5)) # 降低訪問頻率防 ban
-        
-    return pd.DataFrame(scores).sort_values("Date")
+    return pd.DataFrame(scores)
 
 # ==========================================
 # 主程式
 # ==========================================
 def main():
-    print("="*60 + "\n📰 多關鍵字台股新聞加權字典輿情分析器 (嚴格寫入版)\n" + "="*60)
+    print("="*60 + "\n📰 多關鍵字台股新聞加權字典輿情分析器 (全覆寫對齊版)\n" + "="*60)
     try:
-        # 1. 抓取並合併所有關鍵字的分數
         final_df = None
         for kw in CONFIG['KEYWORDS_TO_CRAWL']:
             df_kw = fetch_sentiment_for_keyword(kw)
-            
             if final_df is None:
                 final_df = df_kw
             else:
-                # 依據 Date 合併，確保不同關鍵字對齊在同一日期 (PCA 寬表格式)
                 final_df = pd.merge(final_df, df_kw, on="Date", how="outer")
                 
-        # 依日期排序並將缺少的日期補上 0
         final_df = final_df.sort_values("Date").fillna(0)
         
-        # 2. 測試環境判斷
         if "GSPREAD_CREDENTIALS" not in os.environ:
             print("\n⚠️ 未設定環境變數，僅預覽 DataFrame:")
             print(final_df.head(10))
             return
 
-        # 3. 寫入指定 Google Sheet
         gc = get_gspread_client()
         sp_id = CONFIG["SPREADSHEET_ID"]
         target_sheet = CONFIG["TARGET_SHEET_NAME"]
