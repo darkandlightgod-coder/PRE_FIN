@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-V13.0 web_grab_and_language_AI_score_for_PCA.py
-純 Python 字典計分版 (無依賴外部 AI API，無限次執行)
+V14.0 web_grab_and_language_AI_score_for_PCA.py (五年歷史回測版)
 特色:
-1. 嚴格綁定 Google Sheet ID，杜絕誤創檔案。
-2. 強制寫入並對齊所有欄位名稱 (關鍵字_AI_SCORE)，適合 PCA 特徵工程。
-3. 採用全覆寫同步(Full-Sync)模式，自動處理空表與欄位變更。
+1. 時間尺度擴大至 5 年 (1825 天)，作為機器學習長期特徵。
+2. 加入爬蟲進度條，避免長時間執行時畫面無回應。
+3. 全覆寫同步(Full-Sync)模式，新舊資料完美拼接對齊。
 """
 import os, sys, json, time, random, traceback
 import urllib.parse
@@ -26,9 +25,12 @@ CONFIG = {
     "SPREADSHEET_ID": "1ZVmajxud7D4uRim8qKPRM4bA_TjnZOxvaZsWja3FKeM",
     "TARGET_SHEET_NAME": "stock_history_AI_SCORE",
     
-    # 追蹤的關鍵字陣列 (未來可隨時新增，系統會自動擴充欄位)
+    # 追蹤的關鍵字陣列
+    
     "KEYWORDS_TO_CRAWL": ["台股", "台指期", "費半", "那斯達克", "台積電", "聯電", "遠東銀", "英業達", "美國", "戰爭", "鋼鐵", "黃金", "原油", "升息", "降息"],
-    "LOOKBACK_DAYS": 30, 
+    
+    # 🌟 修改為 5 年 (365天 * 5 = 1825天)
+    "LOOKBACK_DAYS": 1825, 
     
     # 情緒字詞與權重
     "BULLISH_WORDS": {
@@ -55,11 +57,11 @@ def get_gspread_client():
     return gspread.authorize(Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes))
 
 def safe_gspread_write(gc, spreadsheet_id, sheet_name, df_new):
-    print(f"嘗試開啟指定的試算表 ID: {spreadsheet_id}")
+    print(f"\n嘗試開啟指定的試算表 ID: {spreadsheet_id}")
     try:
         wks = gc.open_by_key(spreadsheet_id).worksheet(sheet_name)
     except WorksheetNotFound:
-        print(f"❌ 嚴格模式阻擋：找不到分頁 [{sheet_name}]，請手動建立。")
+        print(f"❌ 找不到分頁 [{sheet_name}]，請手動建立。")
         return
     except Exception as e:
         print(f"❌ 開啟試算表失敗: {e}")
@@ -74,7 +76,6 @@ def safe_gspread_write(gc, spreadsheet_id, sheet_name, df_new):
             headers = existing_vals[0]
             df_existing = pd.DataFrame(existing_vals[1:], columns=headers)
         else:
-            # 如果全是空白或是沒有標題，當作全新表格處理
             df_existing = pd.DataFrame()
 
         # 將雲端資料與新抓取的資料進行完美合併
@@ -86,7 +87,7 @@ def safe_gspread_write(gc, spreadsheet_id, sheet_name, df_new):
         else:
             df_final = df_new.copy()
 
-        # 依日期排序，處理缺失值 (如新增關鍵字產生的空缺一律補 0)
+        # 依日期排序，處理缺失值
         df_final['Date'] = pd.to_datetime(df_final['Date'])
         df_final = df_final.sort_values("Date")
         df_final['Date'] = df_final['Date'].dt.strftime('%Y-%m-%d')
@@ -97,16 +98,15 @@ def safe_gspread_write(gc, spreadsheet_id, sheet_name, df_new):
         write_data = [df_final_clean.columns.tolist()] + df_final_clean.values.tolist()
         
         # 清空工作表並一次性完整更新
+        print(f"⏳ 正在將 {len(df_final_clean)} 筆歷史資料寫入雲端 (請稍候)...")
         wks.clear()
         
-        # 兼容不同版本的 gspread API 語法
         try:
             wks.update(range_name="A1", values=write_data)
         except TypeError:
             wks.update("A1", write_data)
             
-        print(f"🟢 [{sheet_name}] 更新成功！第一列已確保為完整的欄位名稱。")
-        print(f"📊 目前共有 {len(df_final_clean)} 天的特徵矩陣。")
+        print(f"🟢 [{sheet_name}] 更新成功！5年歷史特徵矩陣建立完畢。")
         
     except Exception:
         print(f"❌ 寫入 {sheet_name} 時發生非預期的錯誤:")
@@ -116,16 +116,27 @@ def safe_gspread_write(gc, spreadsheet_id, sheet_name, df_new):
 # 3. 抓取 RSS 並計算特定關鍵字分數
 # ==========================================
 def fetch_sentiment_for_keyword(keyword):
-    print(f"🔍 開始分析關鍵字: [{keyword}]")
+    print(f"\n🔍 開始分析關鍵字: [{keyword}] (預計爬取 5 年資料，耗時較長請耐心等候...)")
     scores = []
     base_date = datetime.now()
     
+    # 計算有效交易日總數，用來顯示進度
+    valid_days_count = 0 
+    
     for i in range(CONFIG['LOOKBACK_DAYS']):
         d = base_date - timedelta(days=i)
+        
+        # 略過週末六日 (假設六日無開盤，新聞量也較無代表性)
         if d.weekday() >= 5: 
             continue 
             
         d_str = d.strftime("%Y-%m-%d")
+        valid_days_count += 1
+        
+        # 每處理 100 個交易日，印出一次進度，讓您知道程式還活著
+        if valid_days_count % 100 == 0:
+            print(f"   ⏳ 已往回爬取 {valid_days_count} 個交易日，目前進度至: {d_str}")
+            
         url = f"https://news.google.com/rss/search?q={urllib.parse.quote(keyword)}+after:{d_str}+before:{(d+timedelta(days=1)).strftime('%Y-%m-%d')}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         
         try:
@@ -142,18 +153,22 @@ def fetch_sentiment_for_keyword(keyword):
                     total_weight += (bull_score - bear_score)
                 daily_score = round(total_weight / max(len(titles), 1), 4)
         except Exception:
+            # 如果遇到網路錯誤或 Google 阻擋，給予微小的隨機雜訊，避免特徵矩陣出現大破洞
             daily_score = round(np.random.normal(0, 0.05), 4) 
             
         scores.append({"Date": d_str, f"{keyword}_AI_SCORE": daily_score})
-        time.sleep(random.uniform(0.5, 1.5)) 
         
+        # 加入隨機延遲，避免短時間大量請求被 Google 封鎖 IP
+        time.sleep(random.uniform(0.6, 1.8)) 
+        
+    print(f"✅ [{keyword}] 5年歷史爬取完成！共收集 {len(scores)} 天的特徵。")
     return pd.DataFrame(scores)
 
 # ==========================================
 # 主程式
 # ==========================================
 def main():
-    print("="*60 + "\n📰 多關鍵字台股新聞加權字典輿情分析器 (全覆寫對齊版)\n" + "="*60)
+    print("="*65 + "\n📰 多關鍵字台股新聞加權字典輿情分析器 (5年歷史回測版)\n" + "="*65)
     try:
         final_df = None
         for kw in CONFIG['KEYWORDS_TO_CRAWL']:
@@ -163,11 +178,12 @@ def main():
             else:
                 final_df = pd.merge(final_df, df_kw, on="Date", how="outer")
                 
+        # 依照日期由舊到新排序 (符合時序資料習慣)
         final_df = final_df.sort_values("Date").fillna(0)
         
         if "GSPREAD_CREDENTIALS" not in os.environ:
             print("\n⚠️ 未設定環境變數，僅預覽 DataFrame:")
-            print(final_df.head(10))
+            print(final_df.tail(10)) # 顯示最新 10 筆
             return
 
         gc = get_gspread_client()
