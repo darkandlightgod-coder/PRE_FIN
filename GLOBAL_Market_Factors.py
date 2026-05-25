@@ -15,37 +15,19 @@ PERIOD = "5y"  # 初始抓取五年資料
 # 預設要抓取的全球市場指標 (共 19 項)
 TARGET_TICKERS = [
     # --- 全球主要指數與風險指標 ---
-    "^GSPC",     # S&P 500 指數
-    "^IXIC",     # 那斯達克綜合指數
-    "^DJI",      # 道瓊工業指數
-    "^SOX",      # 費城半導體指數
-    "^VIX",      # VIX 恐慌指數
-    
+    "^GSPC", "^IXIC", "^DJI", "^SOX", "^VIX",
     # --- 總體經濟與債券 ---
-    "^TNX",      # 美國 10 年期公債殖利率
-    "DX-Y.NYB",  # 美元指數
-    
+    "^TNX", "DX-Y.NYB",
     # --- 能源與貴金屬 ---
-    "GC=F",      # 黃金期貨
-    "CL=F",      # 原油期貨 (WTI)
-    
+    "GC=F", "CL=F",
     # --- 食物與農產品期貨 ---
-    "ZC=F",      # 玉米期貨 (Corn)
-    "ZW=F",      # 小麥期貨 (Wheat)
-    "ZS=F",      # 黃豆期貨 (Soybean)
-    
+    "ZC=F", "ZW=F", "ZS=F",
     # --- 運價指標 ---
-    "BDRY",      # 波羅的海乾散貨 ETF (運價 BDI 的最佳替代指標)
-    
+    "BDRY",
     # --- 重要匯率 (對美元) ---
-    "TWD=X",     # 美元兌台幣
-    "EURUSD=X",  # 歐元兌美元
-    "JPY=X",     # 美元兌日圓
-    "CNY=X",     # 美元兌人民幣
-    
+    "TWD=X", "EURUSD=X", "JPY=X", "CNY=X",
     # --- 虛擬貨幣 ---
-    "BTC-USD",   # 比特幣
-    "ETH-USD"    # 以太幣
+    "BTC-USD", "ETH-USD"
 ]
 
 def extract_series_safely(df, ticker, is_multi):
@@ -66,62 +48,72 @@ def extract_series_safely(df, ticker, is_multi):
 
 def main():
     print("===========================================")
-    print(f"🌍 啟動【全球市場因子】進階初始化建置任務 (期間: {PERIOD})")
+    print(f"🌍 啟動【全球市場因子】無空值初始化任務 (期間: {PERIOD})")
     print("===========================================")
 
     # ------------------------------------------------
-    # 1. 自動生成表頭 (Headers)
+    # 1. 批次下載五年歷史資料
     # ------------------------------------------------
-    print(f"📝 階段一：正在自動生成 {len(TARGET_TICKERS)} 項指標的表頭結構...")
-    headers = ["Date"]
-    for ticker in TARGET_TICKERS:
-        headers.append(f"{ticker}_Close")
-        headers.append(f"{ticker}_Volume")
-    
-    col_idx_map = {name: idx for idx, name in enumerate(headers)}
-    data_by_date = {}
-
-    # ------------------------------------------------
-    # 2. 批次下載五年歷史資料
-    # ------------------------------------------------
-    print(f"\n🕸️ 階段二：光速向 Yahoo 請求 {len(TARGET_TICKERS)} 檔指標近 {PERIOD} 的歷史數據...")
+    print(f"🕸️ 階段一：向 Yahoo 請求 {len(TARGET_TICKERS)} 檔指標近 {PERIOD} 的歷史數據...")
     df_bulk = yf.download(TARGET_TICKERS, period=PERIOD, threads=True, progress=False)
     is_multi = len(TARGET_TICKERS) > 1
 
     # ------------------------------------------------
-    # 3. 處理資料並寫入記憶體陣列
+    # 2. 建立主資料表 (DataFrame) 並合併所有資料
     # ------------------------------------------------
-    print("\n🧠 階段三：資料清洗與對齊中...")
+    print("🧠 階段二：資料合併與日曆對齊中...")
+    # 建立一個以所有抓取到的日期為基礎的 DataFrame (包含假日，因為 Crypto 有假日資料)
+    merged_df = pd.DataFrame(index=df_bulk.index)
+    
     for ticker in TARGET_TICKERS:
         close_series, vol_series = extract_series_safely(df_bulk, ticker, is_multi)
-        
-        close_series = close_series.dropna()
-        vol_series = vol_series.dropna()
-        
-        for date_obj, close_val in close_series.items():
-            date_str = date_obj.strftime("%Y-%m-%d")
-            
-            # 建立空列
-            if date_str not in data_by_date:
-                data_by_date[date_str] = [""] * len(headers)
-                data_by_date[date_str][0] = date_str  # Date
-            
-            # 填入收盤價 (保留四位小數，因應匯率與殖利率的細微變動)
-            c_idx = col_idx_map[f"{ticker}_Close"]
-            data_by_date[date_str][c_idx] = round(close_val, 4)
-            
-            # 填入交易量
-            if date_obj in vol_series:
-                v_idx = col_idx_map[f"{ticker}_Volume"]
-                vol_val = vol_series[date_obj]
-                # 許多匯率或指數沒有實際成交量，避免寫入無效值或 NaN
-                if pd.notna(vol_val) and vol_val > 0:
-                    data_by_date[date_str][v_idx] = int(vol_val)
+        merged_df[f"{ticker}_Close"] = close_series
+        merged_df[f"{ticker}_Volume"] = vol_series
 
     # ------------------------------------------------
-    # 4. 連線 Google Sheet 並強制覆蓋寫入
+    # 3. 處理空值 (Holidays / Weekends) - 關鍵優化
     # ------------------------------------------------
-    print("\n☁️ 階段四：連線 Google Sheet 並寫入資料...")
+    print("✨ 階段三：執行假日空值填補 (前向填充與補零)...")
+    
+    close_cols = [c for c in merged_df.columns if c.endswith("_Close")]
+    vol_cols = [c for c in merged_df.columns if c.endswith("_Volume")]
+
+    # 針對收盤價：使用前向填充 (ffill)，假日沿用上一個交易日的價格
+    merged_df[close_cols] = merged_df[close_cols].ffill()
+    # 防呆機制：如果一開始的前幾天就是假日，用後向填充補齊
+    merged_df[close_cols] = merged_df[close_cols].bfill()
+    # 數值四捨五入到小數點後 4 位
+    merged_df[close_cols] = merged_df[close_cols].round(4)
+
+    # 針對交易量：假日的交易量直接補 0
+    merged_df[vol_cols] = merged_df[vol_cols].fillna(0)
+    
+    # 將剩下的任何極端例外 NaN 轉為空字串，以防萬一
+    merged_df = merged_df.fillna("")
+
+    # ------------------------------------------------
+    # 4. 格式化輸出資料
+    # ------------------------------------------------
+    print("📋 階段四：轉換為 Google Sheet 寫入格式...")
+    # 把 Date 從 Index 變成普通的欄位
+    merged_df = merged_df.reset_index()
+    # 將日期格式化為字串 YYYY-MM-DD
+    merged_df['Date'] = merged_df['Date'].dt.strftime('%Y-%m-%d')
+    
+    # 將部分交易量因為含 NaN 變成 float 的欄位，轉回整數 (0)
+    for col in vol_cols:
+        merged_df[col] = pd.to_numeric(merged_df[col], errors='ignore')
+        # 如果該欄位都是數字，就轉為整數
+        if pd.api.types.is_numeric_dtype(merged_df[col]):
+            merged_df[col] = merged_df[col].astype(int)
+
+    # 轉換成 List of Lists 以便寫入 Google Sheet
+    output_data = [merged_df.columns.tolist()] + merged_df.values.tolist()
+
+    # ------------------------------------------------
+    # 5. 連線 Google Sheet 並強制覆蓋寫入
+    # ------------------------------------------------
+    print("☁️ 階段五：連線 Google Sheet 並寫入資料...")
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_json = json.loads(os.environ.get("GSPREAD_CREDENTIALS", "{}"))
     
@@ -139,17 +131,11 @@ def main():
         print(f"❌ 讀取失敗，請確認已在 Google Drive 建立名為 '{SHEET_NAME}' 的試算表。錯誤: {e}")
         return
 
-    # 排序資料
-    sorted_dates = sorted(data_by_date.keys())
-    output_data = [headers]
-    for d in sorted_dates:
-        output_data.append(data_by_date[d])
-        
     try:
-        print("   正在清空舊表並寫入全新的 5 年巨量資料 (這可能需要幾秒鐘)...")
+        print("   正在清空舊表並寫入全新的巨量資料...")
         wks.clear()
         wks.update(range_name="A1", values=output_data) 
-        print(f"   🎉 任務完成！共寫入 {len(output_data)} 列資料。您的 Google Sheet 已升級為全球總經資料庫！")
+        print(f"   🎉 任務完成！共寫入 {len(output_data)} 列無空值的連續資料！")
     except Exception as e:
         print(f"❌ 寫回 Google Sheet 失敗: {e}")
 
