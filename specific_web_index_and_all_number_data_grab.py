@@ -1,38 +1,39 @@
 # -*- coding: utf-8 -*-
-import os, json
+import os
+import json
+import math
 import gspread
+import pandas as pd
 import yfinance as yf
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
-from gspread.utils import rowcol_to_a1
 
 # ==========================================
 # 參數設定區
 # ==========================================
-TARGET_STOCK = "2330"
 SHEET_NAME = "taifex_derivatives_history"
+PERIOD = "5y"  # 抓取 5 年資料
 
-def get_last_friday():
-    """計算上週五的日期"""
-    today = datetime.now()
-    # weekday() 回傳 0-6 (週一至週日)。週五是 4。
-    # 計算今天距離上週五差幾天
-    offset = (today.weekday() - 4) % 7
-    if offset == 0:
-        offset = 7 # 如果今天就是週五，我們抓「上週五」的資料
-        
-    last_friday = today - timedelta(days=offset)
-    return last_friday
+def get_tickers_from_headers(headers):
+    """
+    掃描表頭，自動提取所有股票代號。
+    例如從 '1101_Close', '2330_Volume' 中提取出 ['1101', '2330']
+    """
+    tickers = set()
+    for header in headers:
+        if header.endswith("_Close") or header.endswith("_Volume"):
+            ticker = header.split('_')[0]
+            tickers.add(ticker)
+    return sorted(list(tickers))
 
 def main():
     print("===========================================")
-    print(f"🚀 啟動任務：依據 Google Sheet 欄位，爬取並更新 {TARGET_STOCK} 上週五資料")
+    print(f"🚀 啟動任務：動態偵測欄位，爬取近 {PERIOD} 歷史資料並批次更新")
     print("===========================================")
 
     # ------------------------------------------------
-    # 1. 連線至 Google Sheet 並讀取表頭
+    # 1. 連線並讀取現有所有資料
     # ------------------------------------------------
-    print("☁️ 階段一：連線至 Google Sheet 讀取現有架構")
+    print("\n☁️ 階段一：連線 Google Sheet 並下載現有資料")
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -53,84 +54,107 @@ def main():
         print(f"❌ 開啟試算表失敗: {e}")
         return
 
-    # 獲取第一列 (表頭) 和第一欄 (日期)
-    headers = wks.row_values(1)
-    date_col_values = wks.col_values(1)
-    
-    close_col_name = f"{TARGET_STOCK}_Close"
-    vol_col_name = f"{TARGET_STOCK}_Volume"
-    
-    if close_col_name not in headers or vol_col_name not in headers:
-        print(f"❌ 在試算表中找不到 {TARGET_STOCK} 的對應欄位 ({close_col_name} 或 {vol_col_name})。")
+    # 獲取整張表的所有資料
+    all_values = wks.get_all_values()
+    if not all_values:
+        print("❌ 試算表是空的，請至少建立包含 Date 和目標股票欄位的表頭。")
         return
 
-    # 找出欄位索引 (0-indexed，但 Google Sheet 是 1-indexed)
+    headers = all_values[0]
+    if "Date" not in headers:
+        print("❌ 表頭找不到 'Date' 欄位，請確認格式。")
+        return
+
     date_idx = headers.index("Date")
-    close_idx = headers.index(close_col_name)
-    vol_idx = headers.index(vol_col_name)
+    col_idx_map = {name: idx for idx, name in enumerate(headers)}
     
-    print(f"   ✅ 成功定位欄位！")
-    print(f"      - Date 在第 {date_idx + 1} 欄")
-    print(f"      - {close_col_name} 在第 {close_idx + 1} 欄")
-    print(f"      - {vol_col_name} 在第 {vol_idx + 1} 欄")
+    # 建立本地記憶體資料庫字典：以 YYYY-MM-DD 為 key
+    data_by_date = {}
+    for row in all_values[1:]:
+        if len(row) > date_idx and row[date_idx]:
+            date_str = row[date_idx]
+            # 確保列長度與表頭一致，不足的補空字串
+            padded_row = row + [""] * (len(headers) - len(row))
+            data_by_date[date_str] = padded_row
 
     # ------------------------------------------------
-    # 2. 計算日期並利用 yfinance 爬取資料
+    # 2. 分析要爬取的股票清單
     # ------------------------------------------------
-    print("\n🕸️ 階段二：計算日期與爬取股價資料")
-    last_friday = get_last_friday()
-    target_date_str = last_friday.strftime('%Y-%m-%d')
-    print(f"   📅 目標日期 (上週五): {target_date_str}")
-    
-    # yfinance 需要 end date 為目標日的「下一天」，這樣才抓得到目標日當天
-    next_day = last_friday + timedelta(days=1)
-    end_date_str = next_day.strftime('%Y-%m-%d')
-    
-    ticker_symbol = f"{TARGET_STOCK}.TW" # 預設當作上市股票
-    print(f"   📈 正在透過 yfinance 獲取 {ticker_symbol} 資料...")
-    
-    hist = yf.Ticker(ticker_symbol).history(start=target_date_str, end=end_date_str)
-    
-    if hist.empty:
-        print(f"   ⚠️ 找不到 {ticker_symbol} 在 {target_date_str} 的交易資料 (可能休市)。")
+    target_tickers = get_tickers_from_headers(headers)
+    if not target_tickers:
+        print("❌ 表頭中未發現符合格式 (例如：2330_Close) 的欄位。")
         return
         
-    close_val = round(hist['Close'].iloc[0], 2)
-    vol_val = int(hist['Volume'].iloc[0])
-    print(f"   ✅ 獲取成功！收盤價: {close_val}, 交易量: {vol_val}")
+    print(f"   ✅ 偵測到需更新的股票清單: {target_tickers}")
 
     # ------------------------------------------------
-    # 3. 將資料精準寫入 Google Sheet
+    # 3. 利用 yfinance 爬取五年資料並合併至本地記憶體
     # ------------------------------------------------
-    print("\n✍️ 階段三：更新至 Google Sheet")
+    print("\n🕸️ 階段二：拉取歷史資料並進行本地合併 (這可能需要幾分鐘...)")
     
+    for ticker in target_tickers:
+        ticker_symbol = f"{ticker}.TW"
+        print(f"   📈 正在下載 {ticker_symbol} 過去 {PERIOD} 資料...")
+        
+        try:
+            hist = yf.Ticker(ticker_symbol).history(period=PERIOD)
+            
+            if hist.empty:
+                print(f"      ⚠️ {ticker_symbol} 查無資料，可能已下市或代號錯誤 (嘗試改用 .TWO 嗎？)。")
+                continue
+                
+            # 遍歷回傳的每一天
+            for date_obj, row_data in hist.iterrows():
+                date_str = date_obj.strftime("%Y-%m-%d")
+                
+                # 如果這一天還不在我們的資料庫裡，建立新的一列
+                if date_str not in data_by_date:
+                    new_row = [""] * len(headers)
+                    new_row[date_idx] = date_str
+                    data_by_date[date_str] = new_row
+                
+                # 更新收盤價
+                close_col_name = f"{ticker}_Close"
+                if close_col_name in col_idx_map and not pd.isna(row_data['Close']):
+                    c_idx = col_idx_map[close_col_name]
+                    data_by_date[date_str][c_idx] = round(row_data['Close'], 2)
+                
+                # 更新交易量
+                vol_col_name = f"{ticker}_Volume"
+                if vol_col_name in col_idx_map and not pd.isna(row_data['Volume']):
+                    v_idx = col_idx_map[vol_col_name]
+                    data_by_date[date_str][v_idx] = int(row_data['Volume'])
+
+            print(f"      ✅ {ticker_symbol} 處理完成，共 {len(hist)} 筆資料。")
+            
+        except Exception as e:
+            print(f"      ❌ 下載或處理 {ticker_symbol} 時發生錯誤: {e}")
+
+    # ------------------------------------------------
+    # 4. 依照日期排序並轉回二維陣列
+    # ------------------------------------------------
+    print("\n🔄 階段三：資料排序與格式化")
+    sorted_dates = sorted(data_by_date.keys())
+    output_data = [headers]
+    
+    for d in sorted_dates:
+        # 確保要上傳的資料沒有 NaN (gspread 不接受 pandas NaN)
+        cleaned_row = ["" if pd.isna(val) else val for val in data_by_date[d]]
+        output_data.append(cleaned_row)
+        
+    print(f"   ✅ 資料整理完畢，總計 {len(output_data) - 1} 個交易日。")
+
+    # ------------------------------------------------
+    # 5. 批次寫入 Google Sheet
+    # ------------------------------------------------
+    print("\n✍️ 階段四：批次寫回 Google Sheet")
     try:
-        if target_date_str in date_col_values:
-            # 日期已存在，更新特定儲存格
-            row_num = date_col_values.index(target_date_str) + 1
-            print(f"   📝 發現 {target_date_str} 已存在於第 {row_num} 列，進行儲存格更新...")
-            
-            # 使用 A1 標記法更新 (例如 C2, D2)
-            close_cell = rowcol_to_a1(row_num, close_idx + 1)
-            vol_cell = rowcol_to_a1(row_num, vol_idx + 1)
-            
-            wks.update(range_name=close_cell, values=[[close_val]])
-            wks.update(range_name=vol_cell, values=[[vol_val]])
-            print(f"   ✅ 儲存格 {close_cell} 與 {vol_cell} 更新完畢！")
-            
-        else:
-            # 日期不存在，新增一整列
-            print(f"   ➕ 找不到 {target_date_str}，準備新增一列...")
-            new_row = [""] * len(headers)
-            new_row[date_idx] = target_date_str
-            new_row[close_idx] = close_val
-            new_row[vol_idx] = vol_val
-            
-            wks.append_row(new_row)
-            print(f"   ✅ 已成功將 {target_date_str} 的資料作為新列附加至試算表底部！")
-            
+        wks.clear()  # 先清空舊資料
+        # 一次性更新所有資料，避免 API rate limit
+        wks.update(range_name="A1", values=output_data) 
+        print(f"   🎉 大功告成！已成功寫入所有歷史資料至 {SHEET_NAME}。")
     except Exception as e:
-        print(f"❌ 寫入資料時發生錯誤: {e}")
+        print(f"❌ 寫回 Google Sheet 時發生錯誤: {e}")
 
 if __name__ == "__main__":
     main()
