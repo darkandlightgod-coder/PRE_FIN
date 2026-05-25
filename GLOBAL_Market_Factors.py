@@ -48,7 +48,7 @@ def extract_series_safely(df, ticker, is_multi):
 
 def main():
     print("===========================================")
-    print(f"🌍 啟動【全球市場因子】無空值初始化任務 (期間: {PERIOD})")
+    print(f"🌍 啟動【全球市場因子】無污染純淨數據任務 (期間: {PERIOD})")
     print("===========================================")
 
     # ------------------------------------------------
@@ -70,36 +70,33 @@ def main():
         merged_df[f"{ticker}_Volume"] = vol_series
 
     # ------------------------------------------------
-    # 3. 處理空值 (Holidays / Weekends)
+    # 3. 處理空值與格式轉換 (保留真實市場狀態)
     # ------------------------------------------------
-    print("✨ 階段三：執行假日空值填補 (前向填充與補零)...")
+    print("✨ 階段三：格式化數據 (保留真實空值，不強行補零)...")
     
     close_cols = [c for c in merged_df.columns if c.endswith("_Close")]
     vol_cols = [c for c in merged_df.columns if c.endswith("_Volume")]
 
-    # 針對收盤價：使用前向填充 (ffill)，防呆用後向填充 (bfill)
-    merged_df[close_cols] = merged_df[close_cols].ffill().bfill().round(4)
-
-    # 針對交易量：假日的交易量直接補 0
-    merged_df[vol_cols] = merged_df[vol_cols].fillna(0)
+    # 收盤價：不補值，僅做四捨五入到小數點後 4 位
+    merged_df[close_cols] = merged_df[close_cols].round(4)
 
     # ------------------------------------------------
-    # 4. 格式化輸出資料 (修復區)
+    # 4. 轉換為 Google Sheet 寫入格式
     # ------------------------------------------------
     print("📋 階段四：轉換為 Google Sheet 寫入格式...")
     
-    # 關鍵修復：強制將索引命名為 'Date'，防止 reset_index 後變成 'index'
+    # 關鍵修復：強制將索引命名為 'Date'
     merged_df.index.name = 'Date'
     merged_df = merged_df.reset_index()
     
     # 將日期格式化為字串 YYYY-MM-DD
     merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.strftime('%Y-%m-%d')
     
-    # 將交易量確保轉為整數 (防呆機制)
+    # 交易量防呆處理：有數值的轉整數(去掉.0)，沒有數值的(NaN)轉為空字串 ""
     for col in vol_cols:
-        merged_df[col] = pd.to_numeric(merged_df[col], errors='coerce').fillna(0).astype(int)
+        merged_df[col] = merged_df[col].apply(lambda x: int(x) if pd.notnull(x) else "")
 
-    # 將剩下的任何極端例外 NaN 轉為空字串，以防 Google Sheet 報錯
+    # 收盤價防呆處理：將剩下的任何 NaN 轉為空字串，以符合 Google Sheet 空白儲存格的邏輯
     merged_df = merged_df.fillna("")
 
     # 轉換成 List of Lists 以便寫入 Google Sheet
@@ -130,7 +127,7 @@ def main():
         print("   正在清空舊表並寫入全新的巨量資料...")
         wks.clear()
         wks.update(range_name="A1", values=output_data) 
-        print(f"   🎉 任務完成！共寫入 {len(output_data)} 列無空值的連續資料！")
+        print(f"   🎉 任務完成！共寫入 {len(output_data)} 列高純度市場資料！")
     except Exception as e:
         print(f"❌ 寫回 Google Sheet 失敗: {e}")
 
