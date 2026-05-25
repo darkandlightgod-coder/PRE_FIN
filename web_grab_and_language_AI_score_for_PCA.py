@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-V11.0 web_grab_and_language_AI_score_for_PCA.py
+V12.0 web_grab_and_language_AI_score_for_PCA.py
 純 Python 字典計分版 (無依賴外部 AI API，無限次執行)
 特色:
 1. 支援多個目標關鍵字，每個關鍵字獨立產出一欄 (例如：台指期_AI_SCORE, 費半_AI_SCORE)。
-2. 報錯防呆再升級：若 Google Sheet 不存在目標工作表，會自動建立。
+2. 嚴格綁定 Google Sheet ID，拔除所有自動建表功能，杜絕誤創檔案。
 3. 採用字典權重法，運算極快，不消耗任何 API 額度。
 """
 import os, sys, json, time, random, traceback
@@ -22,13 +22,15 @@ from google.oauth2.service_account import Credentials
 # 1. 參數設定區
 # ==========================================
 CONFIG = {
+    # 嚴格綁定您的 Google Sheet ID
+    "SPREADSHEET_ID": "1ZVmajxud7D4uRim8qKPRM4bA_TjnZOxvaZsWja3FKeM",
+    "TARGET_SHEET_NAME": "stock_history_AI_SCORE",
+    
     # 您想追蹤的各種關鍵字陣列，可以自由新增或刪除
     "KEYWORDS_TO_CRAWL": ["台股", "台指期", "費半", "那斯達克", "台積電"],
-    
     "LOOKBACK_DAYS": 30, # 回溯天數
-    "TARGET_SHEET_NAME": "stock_history_AI_SCORE", # 新的目標工作表名稱
     
-    # 情緒字詞與權重 (分數越高代表極端情緒)
+    # 情緒字詞與權重
     "BULLISH_WORDS": {
         "狂飆": 3, "暴漲": 3, "創歷史新高": 3,
         "大漲": 2, "創高": 2, "利多": 2, "多頭": 2, "突破": 2,
@@ -42,27 +44,30 @@ CONFIG = {
 }
 
 # ==========================================
-# 2. Google Sheet 認證與寫入 (附帶自動建立工作表防呆)
+# 2. Google Sheet 認證與寫入 (嚴格模式)
 # ==========================================
 def get_gspread_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_json = os.environ.get("GSPREAD_CREDENTIALS")
     if not creds_json:
-        print("⚠️ 找不到 GSPREAD_CREDENTIALS 環境變數。如果您正在本地測試，請確認已設定。")
+        print("⚠️ 找不到 GSPREAD_CREDENTIALS 環境變數。")
         raise ValueError("Missing GSPREAD_CREDENTIALS")
     return gspread.authorize(Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes))
 
 def safe_gspread_write(gc, spreadsheet_id, sheet_name, df):
-    spreadsheet = gc.open_by_key(spreadsheet_id)
-    
-    # --- 防呆機制：如果找不到該 Sheet，就自動建立 ---
+    print(f"嘗試開啟指定的試算表 ID: {spreadsheet_id}")
     try:
+        # 嚴格開啟指定 ID，不允許去抓其他表
+        spreadsheet = gc.open_by_key(spreadsheet_id)
         wks = spreadsheet.worksheet(sheet_name)
     except WorksheetNotFound:
-        print(f"⚠️ 找不到工作表 [{sheet_name}]，系統正為您自動建立...")
-        # 新建工作表，預留足夠的列與欄
-        wks = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=20)
-        print(f"✅ 工作表 [{sheet_name}] 建立成功！")
+        # 完全不執行自動建立，直接擋下來並報錯
+        print(f"❌ 嚴格模式阻擋：在指定的試算表中找不到分頁 [{sheet_name}]。")
+        print("請確認您已經在該 Google Sheet 裡面手動建立好這個分頁，程式拒絕自動創建。")
+        return
+    except Exception as e:
+        print(f"❌ 開啟試算表失敗，可能是權限問題，請確認 Service Account ({e})")
+        return
         
     try:
         # 清理 dataframe 以符合 GSheet 格式
@@ -121,22 +126,21 @@ def fetch_sentiment_for_keyword(keyword):
                 daily_score = round(total_weight / max(len(titles), 1), 4)
                 
         except Exception as e:
-            # 發生錯誤時給予微小雜訊，避免產生極端空值導致 PCA 失真
+            # 發生錯誤時給予微小雜訊，避免產生極端空值
             daily_score = round(np.random.normal(0, 0.05), 4) 
             
-        # 欄位名稱自動加上 _AI_SCORE
+        # 欄位名稱自動依照規則命名
         scores.append({"Date": d_str, f"{keyword}_AI_SCORE": daily_score})
         
         time.sleep(random.uniform(0.5, 1.5)) # 降低訪問頻率防 ban
         
-    # 轉為 dataframe 並排序
     return pd.DataFrame(scores).sort_values("Date")
 
 # ==========================================
 # 主程式
 # ==========================================
 def main():
-    print("="*60 + "\n📰 多關鍵字台股新聞加權字典輿情分析器 (V11.0)\n" + "="*60)
+    print("="*60 + "\n📰 多關鍵字台股新聞加權字典輿情分析器 (嚴格寫入版)\n" + "="*60)
     try:
         # 1. 抓取並合併所有關鍵字的分數
         final_df = None
@@ -146,26 +150,23 @@ def main():
             if final_df is None:
                 final_df = df_kw
             else:
-                # 依據 Date 合併，確保不同關鍵字對齊在同一日期
+                # 依據 Date 合併，確保不同關鍵字對齊在同一日期 (PCA 寬表格式)
                 final_df = pd.merge(final_df, df_kw, on="Date", how="outer")
                 
-        # 依日期排序並將 NaN 填補為 0 (確保模型可以正常讀取)
+        # 依日期排序並將缺少的日期補上 0
         final_df = final_df.sort_values("Date").fillna(0)
         
         # 2. 測試環境判斷
         if "GSPREAD_CREDENTIALS" not in os.environ:
-            print("\n⚠️ 處於本地測試模式 (未設定 GSPREAD_CREDENTIALS)。")
-            print("📊 最終預備寫入的 DataFrame 預覽:")
+            print("\n⚠️ 未設定環境變數，僅預覽 DataFrame:")
             print(final_df.head(10))
             return
 
-        # 3. 寫入 Google Sheet
+        # 3. 寫入指定 Google Sheet
         gc = get_gspread_client()
-        # 取得第一個有權限的試算表ID，您也可以直接把這裡改成 '1ZVmajxud7D4uRim8qKPRM4bA_TjnZOxvaZsWja3FKeM'
-        sp_id = gc.list_spreadsheet_files()[0]['id'] 
-        print(f"\n準備寫入目標 Google Sheet ID: {sp_id}")
-        
+        sp_id = CONFIG["SPREADSHEET_ID"]
         target_sheet = CONFIG["TARGET_SHEET_NAME"]
+        
         safe_gspread_write(gc, sp_id, target_sheet, final_df)
         
     except Exception:
