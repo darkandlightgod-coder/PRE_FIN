@@ -84,18 +84,25 @@ def main():
     # ==========================================
     print("☁️ 階段三：準備寫入 Google Sheet")
     try:
-        # 準備要寫入的資料，目前只有一個元素，也就是 headers 的 List
         data_to_write = [headers]
         req_cols = len(headers)
         
-        creds_json = json.loads(os.environ.get("GSPREAD_CREDENTIALS", "{}"))
-        gc = gspread.authorize(Credentials.from_service_account_info(creds_json))
+        # 🌟 核心修復：宣告需要的 Google API 權限範圍 (Scopes)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
         
+        # 載入金鑰並綁定 Scopes
+        creds_json = json.loads(os.environ.get("GSPREAD_CREDENTIALS", "{}"))
+        credentials = Credentials.from_service_account_info(creds_json, scopes=scopes)
+        gc = gspread.authorize(credentials)
+        
+        # 開啟試算表
         sh = gc.open("taifex_derivatives_history")
         wks = sh.sheet1
         
         print(f"   🧰 正在調整試算表大小，確保能容納 {req_cols} 個欄位...")
-        # 設定為 100 列作為預設緩衝，欄位數則設定為我們動態計算出來的總欄位數
         wks.resize(rows=100, cols=req_cols) 
         
         print("   📝 正在清空舊資料並寫入 1000+ 檔股票的「全新表頭」...")
