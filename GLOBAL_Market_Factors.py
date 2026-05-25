@@ -62,7 +62,6 @@ def main():
     # 2. 建立主資料表 (DataFrame) 並合併所有資料
     # ------------------------------------------------
     print("🧠 階段二：資料合併與日曆對齊中...")
-    # 建立一個以所有抓取到的日期為基礎的 DataFrame (包含假日，因為 Crypto 有假日資料)
     merged_df = pd.DataFrame(index=df_bulk.index)
     
     for ticker in TARGET_TICKERS:
@@ -71,41 +70,37 @@ def main():
         merged_df[f"{ticker}_Volume"] = vol_series
 
     # ------------------------------------------------
-    # 3. 處理空值 (Holidays / Weekends) - 關鍵優化
+    # 3. 處理空值 (Holidays / Weekends)
     # ------------------------------------------------
     print("✨ 階段三：執行假日空值填補 (前向填充與補零)...")
     
     close_cols = [c for c in merged_df.columns if c.endswith("_Close")]
     vol_cols = [c for c in merged_df.columns if c.endswith("_Volume")]
 
-    # 針對收盤價：使用前向填充 (ffill)，假日沿用上一個交易日的價格
-    merged_df[close_cols] = merged_df[close_cols].ffill()
-    # 防呆機制：如果一開始的前幾天就是假日，用後向填充補齊
-    merged_df[close_cols] = merged_df[close_cols].bfill()
-    # 數值四捨五入到小數點後 4 位
-    merged_df[close_cols] = merged_df[close_cols].round(4)
+    # 針對收盤價：使用前向填充 (ffill)，防呆用後向填充 (bfill)
+    merged_df[close_cols] = merged_df[close_cols].ffill().bfill().round(4)
 
     # 針對交易量：假日的交易量直接補 0
     merged_df[vol_cols] = merged_df[vol_cols].fillna(0)
-    
-    # 將剩下的任何極端例外 NaN 轉為空字串，以防萬一
-    merged_df = merged_df.fillna("")
 
     # ------------------------------------------------
-    # 4. 格式化輸出資料
+    # 4. 格式化輸出資料 (修復區)
     # ------------------------------------------------
     print("📋 階段四：轉換為 Google Sheet 寫入格式...")
-    # 把 Date 從 Index 變成普通的欄位
-    merged_df = merged_df.reset_index()
-    # 將日期格式化為字串 YYYY-MM-DD
-    merged_df['Date'] = merged_df['Date'].dt.strftime('%Y-%m-%d')
     
-    # 將部分交易量因為含 NaN 變成 float 的欄位，轉回整數 (0)
+    # 關鍵修復：強制將索引命名為 'Date'，防止 reset_index 後變成 'index'
+    merged_df.index.name = 'Date'
+    merged_df = merged_df.reset_index()
+    
+    # 將日期格式化為字串 YYYY-MM-DD
+    merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.strftime('%Y-%m-%d')
+    
+    # 將交易量確保轉為整數 (防呆機制)
     for col in vol_cols:
-        merged_df[col] = pd.to_numeric(merged_df[col], errors='ignore')
-        # 如果該欄位都是數字，就轉為整數
-        if pd.api.types.is_numeric_dtype(merged_df[col]):
-            merged_df[col] = merged_df[col].astype(int)
+        merged_df[col] = pd.to_numeric(merged_df[col], errors='coerce').fillna(0).astype(int)
+
+    # 將剩下的任何極端例外 NaN 轉為空字串，以防 Google Sheet 報錯
+    merged_df = merged_df.fillna("")
 
     # 轉換成 List of Lists 以便寫入 Google Sheet
     output_data = [merged_df.columns.tolist()] + merged_df.values.tolist()
