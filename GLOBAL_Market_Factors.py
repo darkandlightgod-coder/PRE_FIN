@@ -1,66 +1,134 @@
 # -*- coding: utf-8 -*-
-import os, sys, json, traceback, time
+import os
+import json
 import pandas as pd
-import yfinance as yf
-from datetime import datetime, timedelta
 import gspread
+import yfinance as yf
 from google.oauth2.service_account import Credentials
 
-def get_gspread_client():
-    creds_json = os.environ.get("GSPREAD_CREDENTIALS")
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    return gspread.authorize(Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes))
+# ==========================================
+# 參數設定區
+# ==========================================
+SHEET_NAME = "global_market_factors"
+PERIOD = "5y"  # 初始抓取五年資料
 
-def safe_gspread_write(gc, file_name, df):
-    """【獨立檔案寫入邏輯】：依據檔名開啟獨立的 Google Sheet 檔案"""
+# 預設要抓取的全球市場指標
+TARGET_TICKERS = [
+    "^GSPC",     # S&P 500 指數
+    "^IXIC",     # 那斯達克綜合指數
+    "^DJI",      # 道瓊工業指數
+    "^SOX",      # 費城半導體指數
+    "^VIX",      # VIX 恐慌指數
+    "^TNX",      # 美國 10 年期公債殖利率
+    "DX-Y.NYB",  # 美元指數
+    "GC=F",      # 黃金期貨
+    "CL=F",      # 原油期貨
+    "TWD=X"      # 美元兌台幣匯率
+]
+
+def extract_series_safely(df, ticker, is_multi):
+    """安全地從 Yahoo 批次下載的 DataFrame 中提取單一指標的收盤價與成交量"""
+    if df.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    
     try:
-        time.sleep(2) # ⚠️ 加入防禦性延遲，避免瞬間請求過多被 Google API 封鎖
-        sh = gc.open(file_name)
-        wks = sh.sheet1 # 永遠寫入該檔案的第一個預設分頁
-        if df.empty: return
-        
-        # 強制字串化防護，阻絕 Timestamp/NaN 序列化崩潰
-        df_clean = df.copy()
-        if 'Date' in df_clean.columns and pd.api.types.is_datetime64_any_dtype(df_clean['Date']):
-            df_clean['Date'] = df_clean['Date'].dt.strftime("%Y-%m-%d")
-        df_clean = df_clean.astype(str).replace({"nan": "", "NaN": "", "NaT": "", "None": "", "<NA>": ""})
-        
-        existing = wks.get_all_values()
-        if not existing:
-            wks.update("A1", [df_clean.columns.tolist()] + df_clean.values.tolist())
-            print(f"🟢 檔案 [{file_name}] 初始化成功")
+        if is_multi:
+            close_s = df['Close'][ticker] if 'Close' in df else pd.Series(dtype=float)
+            vol_s = df['Volume'][ticker] if 'Volume' in df else pd.Series(dtype=float)
         else:
-            existing_dates = set([str(row[0]) for row in existing[1:] if row])
-            df_new = df_clean[~df_clean['Date'].astype(str).isin(existing_dates)]
-            if not df_new.empty:
-                wks.append_rows(df_new.values.tolist())
-                print(f"🟢 附加 {len(df_new)} 筆至檔案 [{file_name}]")
-            else:
-                print(f"⚡ 檔案 [{file_name}] 已是最新的")
-    except gspread.exceptions.SpreadsheetNotFound:
-        print(f"❌ 錯誤：找不到名為 '{file_name}' 的檔案！(請確認是否已建立並共用給服務帳號)")
-    except Exception as e:
-        print(f"❌ 寫入檔案 [{file_name}] 異常:\n{traceback.format_exc()}")
+            close_s = df['Close'] if 'Close' in df else pd.Series(dtype=float)
+            vol_s = df['Volume'] if 'Volume' in df else pd.Series(dtype=float)
+        return close_s, vol_s
+    except Exception:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
 
 def main():
-    print("🌍 啟動國際宏觀因子採集")
+    print("===========================================")
+    print(f"🌍 啟動【全球市場因子】初始化建置任務 (期間: {PERIOD})")
+    print("===========================================")
+
+    # ------------------------------------------------
+    # 1. 自動生成表頭 (Headers)
+    # ------------------------------------------------
+    print("📝 階段一：正在自動生成表頭結構...")
+    headers = ["Date"]
+    for ticker in TARGET_TICKERS:
+        headers.append(f"{ticker}_Close")
+        headers.append(f"{ticker}_Volume")
+    
+    col_idx_map = {name: idx for idx, name in enumerate(headers)}
+    data_by_date = {}
+
+    # ------------------------------------------------
+    # 2. 批次下載五年歷史資料
+    # ------------------------------------------------
+    print(f"\n🕸️ 階段二：光速向 Yahoo 請求 {len(TARGET_TICKERS)} 檔指標近 {PERIOD} 的歷史數據...")
+    df_bulk = yf.download(TARGET_TICKERS, period=PERIOD, threads=True, progress=False)
+    is_multi = len(TARGET_TICKERS) > 1
+
+    # ------------------------------------------------
+    # 3. 處理資料並寫入記憶體陣列
+    # ------------------------------------------------
+    print("\n🧠 階段三：資料清洗與對齊中...")
+    for ticker in TARGET_TICKERS:
+        close_series, vol_series = extract_series_safely(df_bulk, ticker, is_multi)
+        
+        close_series = close_series.dropna()
+        vol_series = vol_series.dropna()
+        
+        for date_obj, close_val in close_series.items():
+            date_str = date_obj.strftime("%Y-%m-%d")
+            
+            # 建立空列
+            if date_str not in data_by_date:
+                data_by_date[date_str] = [""] * len(headers)
+                data_by_date[date_str][0] = date_str  # Date
+            
+            # 填入收盤價 (保留四位小數，因應匯率與殖利率)
+            c_idx = col_idx_map[f"{ticker}_Close"]
+            data_by_date[date_str][c_idx] = round(close_val, 4)
+            
+            # 填入交易量
+            if date_obj in vol_series:
+                v_idx = col_idx_map[f"{ticker}_Volume"]
+                vol_val = vol_series[date_obj]
+                if pd.notna(vol_val) and vol_val > 0: # 確保有交易量才填
+                    data_by_date[date_str][v_idx] = int(vol_val)
+
+    # ------------------------------------------------
+    # 4. 連線 Google Sheet 並強制覆蓋寫入
+    # ------------------------------------------------
+    print("\n☁️ 階段四：連線 Google Sheet 並寫入資料...")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds_json = json.loads(os.environ.get("GSPREAD_CREDENTIALS", "{}"))
+    
+    if not creds_json:
+        print("❌ 找不到 GSPREAD_CREDENTIALS 環境變數。")
+        return
+        
+    credentials = Credentials.from_service_account_info(creds_json, scopes=scopes)
+    gc = gspread.authorize(credentials)
+    
     try:
-        gc = get_gspread_client()
-        # ⚠️ 這裡將 GC=F 替換為 GLD (SPDR 黃金 ETF)，避免 Yahoo Finance 報錯
-        tickers = {"^TWII": "TWII", "GLD": "Gold", "^TNX": "US10Y", "^VIX": "VIX", "^SOX": "SOX", "^GSPC": "SP500"}
-        start_date = (datetime.now() - timedelta(days=5*365)).strftime("%Y-%m-%d")
-        
-        print("⏳ 正在從 Yahoo Finance 獲取數據...")
-        data = yf.download(list(tickers.keys()), start=start_date, progress=False)
-        df_macro = data['Close'] if isinstance(data.columns, pd.MultiIndex) else data
-        df_macro.rename(columns=tickers, inplace=True)
-        df_macro = df_macro.ffill().dropna(how='all').reset_index()
-        df_macro.rename(columns={'index': 'Date', 'Date': 'Date'}, inplace=True)
-        
-        # 寫入指定的獨立檔案
-        safe_gspread_write(gc, "global_market_factors", df_macro)
+        sh = gc.open(SHEET_NAME)
+        wks = sh.sheet1
     except Exception as e:
-        print(f"❌ 模組崩潰:\n{traceback.format_exc()}")
+        print(f"❌ 讀取失敗，請確認已在 Google Drive 建立名為 '{SHEET_NAME}' 的試算表。錯誤: {e}")
+        return
+
+    # 排序資料
+    sorted_dates = sorted(data_by_date.keys())
+    output_data = [headers]
+    for d in sorted_dates:
+        output_data.append(data_by_date[d])
+        
+    try:
+        print("   正在清空舊表並寫入全新的 5 年資料 (這可能需要幾秒鐘)...")
+        wks.clear()
+        wks.update(range_name="A1", values=output_data) 
+        print(f"   🎉 任務完成！共寫入 {len(output_data)} 列資料。您的 Google Sheet 已完成初始化！")
+    except Exception as e:
+        print(f"❌ 寫回 Google Sheet 失敗: {e}")
 
 if __name__ == "__main__":
     main()
