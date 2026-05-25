@@ -12,18 +12,40 @@ from google.oauth2.service_account import Credentials
 SHEET_NAME = "global_market_factors"
 PERIOD = "5y"  # 初始抓取五年資料
 
-# 預設要抓取的全球市場指標
+# 預設要抓取的全球市場指標 (共 19 項)
 TARGET_TICKERS = [
+    # --- 全球主要指數與風險指標 ---
     "^GSPC",     # S&P 500 指數
     "^IXIC",     # 那斯達克綜合指數
     "^DJI",      # 道瓊工業指數
     "^SOX",      # 費城半導體指數
     "^VIX",      # VIX 恐慌指數
+    
+    # --- 總體經濟與債券 ---
     "^TNX",      # 美國 10 年期公債殖利率
     "DX-Y.NYB",  # 美元指數
+    
+    # --- 能源與貴金屬 ---
     "GC=F",      # 黃金期貨
-    "CL=F",      # 原油期貨
-    "TWD=X"      # 美元兌台幣匯率
+    "CL=F",      # 原油期貨 (WTI)
+    
+    # --- 食物與農產品期貨 ---
+    "ZC=F",      # 玉米期貨 (Corn)
+    "ZW=F",      # 小麥期貨 (Wheat)
+    "ZS=F",      # 黃豆期貨 (Soybean)
+    
+    # --- 運價指標 ---
+    "BDRY",      # 波羅的海乾散貨 ETF (運價 BDI 的最佳替代指標)
+    
+    # --- 重要匯率 (對美元) ---
+    "TWD=X",     # 美元兌台幣
+    "EURUSD=X",  # 歐元兌美元
+    "JPY=X",     # 美元兌日圓
+    "CNY=X",     # 美元兌人民幣
+    
+    # --- 虛擬貨幣 ---
+    "BTC-USD",   # 比特幣
+    "ETH-USD"    # 以太幣
 ]
 
 def extract_series_safely(df, ticker, is_multi):
@@ -44,13 +66,13 @@ def extract_series_safely(df, ticker, is_multi):
 
 def main():
     print("===========================================")
-    print(f"🌍 啟動【全球市場因子】初始化建置任務 (期間: {PERIOD})")
+    print(f"🌍 啟動【全球市場因子】進階初始化建置任務 (期間: {PERIOD})")
     print("===========================================")
 
     # ------------------------------------------------
     # 1. 自動生成表頭 (Headers)
     # ------------------------------------------------
-    print("📝 階段一：正在自動生成表頭結構...")
+    print(f"📝 階段一：正在自動生成 {len(TARGET_TICKERS)} 項指標的表頭結構...")
     headers = ["Date"]
     for ticker in TARGET_TICKERS:
         headers.append(f"{ticker}_Close")
@@ -84,7 +106,7 @@ def main():
                 data_by_date[date_str] = [""] * len(headers)
                 data_by_date[date_str][0] = date_str  # Date
             
-            # 填入收盤價 (保留四位小數，因應匯率與殖利率)
+            # 填入收盤價 (保留四位小數，因應匯率與殖利率的細微變動)
             c_idx = col_idx_map[f"{ticker}_Close"]
             data_by_date[date_str][c_idx] = round(close_val, 4)
             
@@ -92,7 +114,8 @@ def main():
             if date_obj in vol_series:
                 v_idx = col_idx_map[f"{ticker}_Volume"]
                 vol_val = vol_series[date_obj]
-                if pd.notna(vol_val) and vol_val > 0: # 確保有交易量才填
+                # 許多匯率或指數沒有實際成交量，避免寫入無效值或 NaN
+                if pd.notna(vol_val) and vol_val > 0:
                     data_by_date[date_str][v_idx] = int(vol_val)
 
     # ------------------------------------------------
@@ -123,10 +146,10 @@ def main():
         output_data.append(data_by_date[d])
         
     try:
-        print("   正在清空舊表並寫入全新的 5 年資料 (這可能需要幾秒鐘)...")
+        print("   正在清空舊表並寫入全新的 5 年巨量資料 (這可能需要幾秒鐘)...")
         wks.clear()
         wks.update(range_name="A1", values=output_data) 
-        print(f"   🎉 任務完成！共寫入 {len(output_data)} 列資料。您的 Google Sheet 已完成初始化！")
+        print(f"   🎉 任務完成！共寫入 {len(output_data)} 列資料。您的 Google Sheet 已升級為全球總經資料庫！")
     except Exception as e:
         print(f"❌ 寫回 Google Sheet 失敗: {e}")
 
