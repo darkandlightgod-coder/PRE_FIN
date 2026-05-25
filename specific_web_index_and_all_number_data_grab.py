@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-import os, sys, glob, json, time
+import os, sys, glob, json
 import pandas as pd
-import yfinance as yf
-from datetime import datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 
 # ==========================================
-# 1. 核心邏輯：讀取 CSV 並判斷 yfinance 股票代號後綴
+# 1. 核心邏輯：讀取 CSV 並提取股票代號
 # ==========================================
 def get_stock_codes_with_suffix():
     """
@@ -59,7 +57,7 @@ def get_stock_codes_with_suffix():
     return stock_dict
 
 # ==========================================
-# 2. 爬取與資料整理 (效能無破碎化優化版)
+# 2. 僅建立欄位並寫入 Google Sheet
 # ==========================================
 def main():
     stock_dict = get_stock_codes_with_suffix()
@@ -67,102 +65,44 @@ def main():
         print("❌ 找不到任何股票代號，程式終止。")
         return
 
+    # 將代碼排序
     sorted_codes = sorted(list(stock_dict.keys()))
     
-    # 建立表頭驗證用
+    # 建立表頭：Date, 1101_Close, 1101_Volume, 1102_Close...
     headers = ["Date"]
     for code in sorted_codes:
         headers.extend([f"{code}_Close", f"{code}_Volume"])
         
     print(f"📊 預計生成的 Google Sheet 總欄位數將達: {len(headers)} 欄！")
-
-    start_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-    end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    
-    chunk_size = 50
-    df_list = [] # 🌟 核心修改：用 List 收集各個小塊，避免 Pandas DataFrame 碎片化
     
     print("===========================================")
-    print("🕷️ 階段二：開始從 Yahoo Finance 爬取交易資料")
-    
-    for i in range(0, len(sorted_codes), chunk_size):
-        chunk_codes = sorted_codes[i:i+chunk_size]
-        tickers = [f"{code}{stock_dict[code]}" for code in chunk_codes]
-        
-        print(f"   ⏳ 正在爬取第 {i+1} 至 {i+len(chunk_codes)} 檔 ({tickers[0]} ~ {tickers[-1]})...")
-        data = yf.download(tickers, start=start_date, end=end_date, progress=False)
-        
-        if data.empty:
-            continue
-            
-        # 暫存這個區塊的 Series 資料
-        chunk_dict = {}
-        is_multi_index = isinstance(data.columns, pd.MultiIndex)
-        
-        for code in chunk_codes:
-            ticker = f"{code}{stock_dict[code]}"
-            
-            # 安全獲取 Series (確保欄位對齊，並防禦 yfinance 回傳結構變化的特例)
-            if is_multi_index:
-                c_ser = data['Close'][ticker] if ('Close' in data.columns and ticker in data['Close']) else pd.Series(dtype=float)
-                v_ser = data['Volume'][ticker] if ('Volume' in data.columns and ticker in data['Volume']) else pd.Series(dtype=float)
-            else:
-                c_ser = data['Close'] if 'Close' in data.columns else pd.Series(dtype=float)
-                v_ser = data['Volume'] if 'Volume' in data.columns else pd.Series(dtype=float)
-            
-            chunk_dict[f"{code}_Close"] = c_ser
-            chunk_dict[f"{code}_Volume"] = v_ser
-            
-        # 將這個小區塊轉成 DataFrame 並塞入 List
-        chunk_df = pd.DataFrame(chunk_dict)
-        df_list.append(chunk_df)
-
+    print("🛑 應要求：已略過 yfinance 爬蟲階段，直接進入寫入表頭程序。")
     print("===========================================")
-    print("🧩 階段二-2：正在一次性合併 1000+ 檔股票的 DataFrame (無破碎化)")
-    
-    if df_list:
-        # 🌟 核心修改：使用 pd.concat() 一次性合併！速度最快且不會報錯
-        final_df = pd.concat(df_list, axis=1)
-        final_df.fillna(0, inplace=True) # 將 NaN 轉為 0
-        
-        # 整理 Date 欄位
-        final_df.index = final_df.index.strftime('%Y-%m-%d')
-        final_df.index.name = 'Date'
-        final_df.reset_index(inplace=True)
-    else:
-        print("⚠️ 警告：無法從 Yahoo 獲取任何資料！")
-        final_df = pd.DataFrame(columns=headers)
-    
-    # 確保最終 DataFrame 欄位順序與 headers 一致 (補齊可能缺失的欄位)
-    for col in headers:
-        if col not in final_df.columns:
-            final_df[col] = 0
-    final_df = final_df[headers]
 
     # ==========================================
-    # 3. 寫入 Google Sheet 邏輯
+    # 3. 寫入 Google Sheet 邏輯 (僅寫入第一列)
     # ==========================================
-    print("===========================================")
     print("☁️ 階段三：準備寫入 Google Sheet")
     try:
+        # 準備要寫入的資料，目前只有一個元素，也就是 headers 的 List
+        data_to_write = [headers]
+        req_cols = len(headers)
+        
         creds_json = json.loads(os.environ.get("GSPREAD_CREDENTIALS", "{}"))
         gc = gspread.authorize(Credentials.from_service_account_info(creds_json))
         
         sh = gc.open("taifex_derivatives_history")
         wks = sh.sheet1
         
-        data_to_write = [headers] + final_df.astype(str).values.tolist()
-        req_rows = len(data_to_write)
-        req_cols = len(headers)
+        print(f"   🧰 正在調整試算表大小，確保能容納 {req_cols} 個欄位...")
+        # 設定為 100 列作為預設緩衝，欄位數則設定為我們動態計算出來的總欄位數
+        wks.resize(rows=100, cols=req_cols) 
         
-        print(f"   🧰 正在調整試算表大小至 {req_rows} 列 x {req_cols} 欄...")
-        wks.resize(rows=max(100, req_rows), cols=req_cols) 
-        
-        print("   📝 正在清空舊資料並寫入新資料...")
+        print("   📝 正在清空舊資料並寫入 1000+ 檔股票的「全新表頭」...")
         wks.clear()
         wks.update("A1", data_to_write)
         
-        print("✅ 任務圓滿完成！1000+ 股票資料已成功同步至 taifex_derivatives_history！")
+        print("✅ 任務圓滿完成！請前往 Google Sheet 確認數千個欄位是否已成功建立！")
         
     except Exception as e:
         print(f"❌ 寫入 Google Sheet 時發生錯誤: {e}")
