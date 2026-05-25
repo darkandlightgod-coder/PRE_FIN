@@ -28,4 +28,4 @@ jobs:
         # 將 GitHub Secrets 傳遞給 Python 環境變數
         GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
       run: |
-        python web_grab_and_language_AI_score_for_PCA.py
+        python PCA_TWII.py
