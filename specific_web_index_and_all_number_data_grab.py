@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
 import json
-import time
 import pandas as pd
 import gspread
 import yfinance as yf
@@ -11,11 +10,10 @@ from google.oauth2.service_account import Credentials
 # 參數設定區
 # ==========================================
 SHEET_NAME = "taifex_derivatives_history"
-PERIOD = "1mo"  # 若要補 5 年，請改成 "5y" 執行一次即可
-DELAY_SECONDS = 1.5  # 每次請求間隔 1.5 秒，防止被 Yahoo 封鎖
+PERIOD = "1mo"  # 每日更新抓近1個月，若要重抓5年可改為 "5y"
 
 def get_tickers_from_headers(headers):
-    """掃描表頭，自動提取所有股票代號"""
+    """掃描表頭，提取所有的基礎股票代號 (不含 .TW)"""
     tickers = set()
     for header in headers:
         if header.endswith("_Close") or header.endswith("_Volume"):
@@ -23,56 +21,85 @@ def get_tickers_from_headers(headers):
             tickers.add(ticker)
     return sorted(list(tickers))
 
-def fetch_stock_data(ticker, period):
-    """
-    智能下載器：先嘗試 .TW (上市)，若失敗自動嘗試 .TWO (上櫃)
-    """
-    suffixes = [".TW", ".TWO"]
+def extract_series_safely(df, ticker, is_multi):
+    """安全地從 Yahoo 批次下載的 DataFrame 中提取單一股票的收盤價與成交量"""
+    if df.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
     
-    for suffix in suffixes:
-        symbol = f"{ticker}{suffix}"
-        try:
-            hist = yf.Ticker(symbol).history(period=period)
-            if not hist.empty:
-                print(f"      ✅ 成功取得 {symbol} 資料 ({len(hist)} 筆)")
-                return hist
-        except Exception:
-            pass # 發生錯誤就默默忽略，繼續嘗試下一個後綴
+    try:
+        # yfinance 批次下載時，如果超過1檔，會返回 MultiIndex DataFrame
+        if is_multi:
+            close_s = df['Close'][ticker] if 'Close' in df else pd.Series(dtype=float)
+            vol_s = df['Volume'][ticker] if 'Volume' in df else pd.Series(dtype=float)
+        else:
+            close_s = df['Close'] if 'Close' in df else pd.Series(dtype=float)
+            vol_s = df['Volume'] if 'Volume' in df else pd.Series(dtype=float)
+        return close_s, vol_s
+    except Exception:
+        # 抓不到該檔股票時，返回空的 Series
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+def get_bulk_data(base_tickers, period):
+    """使用超壓縮格式 (Batch Download) 極速取得資料，並自動切換上市櫃"""
+    successful_data = {}
+    failed_bases = []
+
+    # 1. 第一次批次攻擊：全部當作上市 (.TW) 抓取
+    tw_tickers = [f"{t}.TW" for t in base_tickers]
+    print(f"   🚀 [批次 1] 正在同時下載 {len(tw_tickers)} 檔上市 (.TW) 股票...")
+    # threads=True 啟用多執行緒，progress=False 關閉進度條以保持終端機乾淨
+    df_tw = yf.download(tw_tickers, period=period, threads=True, progress=False)
+    
+    is_multi_tw = len(tw_tickers) > 1
+
+    # 檢驗哪些成功，哪些失敗
+    for base in base_tickers:
+        t_tw = f"{base}.TW"
+        close_s, vol_s = extract_series_safely(df_tw, t_tw, is_multi_tw)
+        
+        if close_s.dropna().empty:
+            failed_bases.append(base) # 失敗的先存起來
+        else:
+            successful_data[base] = {'Close': close_s, 'Volume': vol_s}
+
+    # 2. 第二次批次攻擊：把失敗的當作上櫃 (.TWO) 抓取
+    if failed_bases:
+        two_tickers = [f"{t}.TWO" for t in failed_bases]
+        print(f"   🚀 [批次 2] 偵測到 {len(failed_bases)} 檔查無資料，自動切換下載上櫃 (.TWO) 股票...")
+        df_two = yf.download(two_tickers, period=period, threads=True, progress=False)
+        
+        is_multi_two = len(two_tickers) > 1
+        
+        for base in failed_bases:
+            t_two = f"{base}.TWO"
+            close_s, vol_s = extract_series_safely(df_two, t_two, is_multi_two)
             
-    # 如果兩個都失敗，回傳空的 DataFrame
-    print(f"      ⚠️ 無法取得 {ticker} 資料 (可能是興櫃股、已下市，或網路異常)")
-    return pd.DataFrame()
+            if not close_s.dropna().empty:
+                successful_data[base] = {'Close': close_s, 'Volume': vol_s}
+            else:
+                print(f"      ⚠️ 放棄：{base} 兩次嘗試皆失敗 (可能是興櫃、下市或異常)")
+
+    return successful_data
 
 def main():
     print("===========================================")
-    print(f"🛡️ 啟動強韌版爬蟲任務：自動判斷上市櫃、防止 IP 封鎖")
+    print(f"⚡ 啟動光速批次更新器 (多執行緒版)")
     print("===========================================")
 
     # ------------------------------------------------
-    # 1. 讀取 Google Sheet 現有資料庫
+    # 1. 讀取 Google Sheet
     # ------------------------------------------------
     print("☁️ 階段一：讀取 Google Sheet 現有資料庫...")
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_json = json.loads(os.environ.get("GSPREAD_CREDENTIALS", "{}"))
     
-    if not creds_json:
-        print("❌ 找不到 GSPREAD_CREDENTIALS 環境變數。")
-        return
-        
     credentials = Credentials.from_service_account_info(creds_json, scopes=scopes)
     gc = gspread.authorize(credentials)
     
-    try:
-        sh = gc.open(SHEET_NAME)
-        wks = sh.sheet1
-        all_values = wks.get_all_values()
-    except Exception as e:
-        print(f"❌ 讀取 Google Sheet 失敗: {e}")
-        return
+    sh = gc.open(SHEET_NAME)
+    wks = sh.sheet1
+    all_values = wks.get_all_values()
     
-    if not all_values:
-        return
-        
     headers = all_values[0]
     date_idx = headers.index("Date")
     col_idx_map = {name: idx for idx, name in enumerate(headers)}
@@ -85,58 +112,59 @@ def main():
             data_by_date[date_str] = padded_row
 
     target_tickers = get_tickers_from_headers(headers)
-    print(f"   ✅ 追蹤清單共 {len(target_tickers)} 檔股票")
+    print(f"   ✅ 共需更新 {len(target_tickers)} 檔股票。")
 
     # ------------------------------------------------
-    # 2. 爬取近期資料 (具備防封鎖與智能 fallback)
+    # 2. 批次下載資料
     # ------------------------------------------------
-    print(f"\n🕸️ 階段二：抓取最近 {PERIOD} 資料...")
+    print(f"\n🕸️ 階段二：光速下載最近 {PERIOD} 資料...")
+    bulk_data = get_bulk_data(target_tickers, PERIOD)
     
-    for idx, ticker in enumerate(target_tickers):
-        print(f"   [{idx+1}/{len(target_tickers)}] 正在處理 {ticker}...")
+    # ------------------------------------------------
+    # 3. 遍歷批次資料，進行智能補完與新增 (rbind)
+    # ------------------------------------------------
+    print("\n🧠 階段三：將新資料與空值補完寫入記憶體...")
+    for base, stock_data in bulk_data.items():
+        close_series = stock_data['Close'].dropna()
+        vol_series = stock_data['Volume'].dropna()
         
-        hist = fetch_stock_data(ticker, PERIOD)
-        
-        if not hist.empty:
-            for date_obj, row_data in hist.iterrows():
-                date_str = date_obj.strftime("%Y-%m-%d")
-                
-                if date_str not in data_by_date:
-                    new_row = [""] * len(headers)
-                    new_row[date_idx] = date_str
-                    data_by_date[date_str] = new_row
-                
-                close_col_name = f"{ticker}_Close"
-                if close_col_name in col_idx_map and not pd.isna(row_data['Close']):
-                    c_idx = col_idx_map[close_col_name]
-                    if data_by_date[date_str][c_idx] == "":
-                        data_by_date[date_str][c_idx] = round(row_data['Close'], 2)
-                
-                vol_col_name = f"{ticker}_Volume"
-                if vol_col_name in col_idx_map and not pd.isna(row_data['Volume']):
-                    v_idx = col_idx_map[vol_col_name]
-                    if data_by_date[date_str][v_idx] == "":
-                        data_by_date[date_str][v_idx] = int(row_data['Volume'])
-        
-        # 【關鍵防護】爬完一檔，睡個幾秒鐘，避免被 Yahoo 封鎖
-        time.sleep(DELAY_SECONDS)
+        for date_obj, close_val in close_series.items():
+            date_str = date_obj.strftime("%Y-%m-%d")
+            
+            # 若為新日期則新增一列
+            if date_str not in data_by_date:
+                new_row = [""] * len(headers)
+                new_row[date_idx] = date_str
+                data_by_date[date_str] = new_row
+            
+            # 更新收盤價
+            c_col = f"{base}_Close"
+            if c_col in col_idx_map:
+                c_idx = col_idx_map[c_col]
+                if data_by_date[date_str][c_idx] == "":
+                    data_by_date[date_str][c_idx] = round(close_val, 2)
+            
+            # 更新交易量
+            v_col = f"{base}_Volume"
+            if v_col in col_idx_map and date_obj in vol_series:
+                v_idx = col_idx_map[v_col]
+                vol_val = vol_series[date_obj]
+                if pd.notna(vol_val) and data_by_date[date_str][v_idx] == "":
+                    data_by_date[date_str][v_idx] = int(vol_val)
 
     # ------------------------------------------------
-    # 3. 排序與寫回
+    # 4. 排序與寫回
     # ------------------------------------------------
-    print("\n🔄 階段三：排序與覆蓋寫回")
+    print("\n🔄 階段四：排序並整包覆蓋寫回 Google Sheet...")
     sorted_dates = sorted(data_by_date.keys())
     output_data = [headers]
     
     for d in sorted_dates:
         output_data.append(data_by_date[d])
         
-    try:
-        wks.clear()
-        wks.update(range_name="A1", values=output_data) 
-        print(f"   🎉 任務完成！資料已安全同步至 Google Sheet。")
-    except Exception as e:
-        print(f"❌ 寫回 Google Sheet 失敗: {e}")
+    wks.clear()
+    wks.update(range_name="A1", values=output_data) 
+    print(f"   🎉 任務完成！光速更新結束。")
 
 if __name__ == "__main__":
     main()
