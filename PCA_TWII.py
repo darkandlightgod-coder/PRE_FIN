@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-V11.2 PCA_TWII.py (增強除錯與防呆版)
-加強 Google Sheets 讀取防呆機制、Date 欄位自動偵測
+V11.3 PCA_TWII.py (精準定位版)
+解決抓錯試算表的問題，加入智慧檔案掃描機制，並支援直接輸入網址。
 """
 import os
 import sys
 import subprocess
 import importlib
 from datetime import datetime
+
+# ==========================================
+# 💡 終極解法：您可以直接把試算表網址貼在下面引號內！
+# 如果留空 ""，程式就會自動啟動「智慧尋找機制」
+# ==========================================
+SPREADSHEET_URL = "" 
+
 
 # ==========================================
 # 【0. 環境自癒與延遲載入】
@@ -100,15 +107,12 @@ def safe_gspread_write(gc, sp_id, sheet_name, df, mode="clear_update"):
             time.sleep(2)
     return False
 
-def load_data_lake(gc, sp_id):
+def load_data_lake(sh):
     """讀取並強化清理資料湖 (具備防呆機制)"""
-    sh = gc.open_by_key(sp_id)
-    print(f"   📄 成功連線試算表: {sh.title}")
-    
     try:
         ws = sh.worksheet("global_market_factors")
     except gspread.exceptions.WorksheetNotFound:
-        raise ValueError(f"找不到分頁 'global_market_factors'！請確認爬蟲是否有寫入此檔案 ({sh.title})。")
+        raise ValueError(f"在試算表 '{sh.title}' 中找不到 'global_market_factors' 分頁！")
         
     data = ws.get_all_values()
     if not data or len(data) < 2:
@@ -116,7 +120,7 @@ def load_data_lake(gc, sp_id):
         
     df = pd.DataFrame(data[1:], columns=data[0])
     
-    # 防呆：如果找不到 Date，試著找找看有沒有中文的「日期」，或者強制拿第一欄
+    # 防呆：尋找 Date 欄位
     if 'Date' not in df.columns:
         if '日期' in df.columns:
             df.rename(columns={'日期': 'Date'}, inplace=True)
@@ -129,17 +133,16 @@ def load_data_lake(gc, sp_id):
     try:
         df['Date'] = pd.to_datetime(df['Date'])
     except Exception as e:
-        raise ValueError(f"日期格式轉換失敗！請檢查 Date 欄位裡是不是有奇怪的文字。詳細錯誤: {e}")
+        raise ValueError(f"日期格式轉換失敗！請檢查 Date 欄位。錯誤: {e}")
         
     df.set_index('Date', inplace=True)
     df = df.apply(pd.to_numeric, errors='coerce')
-    df = df.ffill().bfill() # 填補各國休市空值
+    df = df.ffill().bfill() 
     
-    # 刪除完全是空值的欄位
     df.dropna(axis=1, how='all', inplace=True)
     
     if df.empty:
-        raise ValueError("資料清洗後變成完全空值！請檢查表內資料是否都是非數字的字串。")
+        raise ValueError("資料清洗後變成完全空值！請檢查表內資料。")
         
     return df
 
@@ -201,22 +204,45 @@ def predict_stock_returns(X_pca_df, ticker):
 # ==========================================
 def main():
     print("="*60)
-    print("🧠 PCA 預測大腦 (防呆診斷版)")
+    print("🧠 PCA 預測大腦 (精準定位版)")
     print("="*60)
     
     try:
         gc = get_gspread_client()
-        files = gc.list_spreadsheet_files()
-        if not files:
-            raise ValueError("您的服務帳戶沒有存取任何試算表的權限！請確認您有將試算表共用給服務帳戶的 Email。")
-            
-        sp_id = files[0]['id'] 
+        target_sh = None
         
-        print("\n步驟 1: 載入並清理資料湖 (Data Lake)...")
-        df_lake = load_data_lake(gc, sp_id)
+        print("\n步驟 1: 定位資料湖試算表...")
+        
+        if SPREADSHEET_URL.strip():
+            print("   🔗 偵測到手動輸入網址，嘗試連線...")
+            target_sh = gc.open_by_url(SPREADSHEET_URL.strip())
+        else:
+            print("   🔍 啟動智慧掃描，尋找包含 'global_market_factors' 的檔案...")
+            files = gc.list_spreadsheet_files()
+            if not files:
+                raise ValueError("服務帳戶沒有權限存取任何試算表！")
+                
+            for f in files:
+                try:
+                    temp_sh = gc.open_by_key(f['id'])
+                    # 測試有沒有這個分頁
+                    temp_sh.worksheet("global_market_factors")
+                    target_sh = temp_sh
+                    print(f"   🎯 找到了！正確的檔案是: {target_sh.title}")
+                    break
+                except Exception:
+                    continue
+                    
+        if not target_sh:
+            raise ValueError("掃描完所有檔案，都找不到 'global_market_factors'！\n請確認：1. 爬蟲是否成功寫入資料？ 2. 或是將網址直接貼到程式的 SPREADSHEET_URL 變數中！")
+            
+        sp_id = target_sh.id
+        
+        print("\n步驟 2: 載入並清理資料湖 (Data Lake)...")
+        df_lake = load_data_lake(target_sh)
         print(f"   ✅ 成功載入特徵，資料筆數: {len(df_lake)}")
         
-        print("\n步驟 2: 執行全局 PCA 降維萃取大盤核心情緒...")
+        print("\n步驟 3: 執行全局 PCA 降維萃取大盤核心情緒...")
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df_lake)
         
@@ -228,7 +254,7 @@ def main():
         df_pca_output['Date'] = df_pca_output['Date'].dt.strftime('%Y-%m-%d')
         safe_gspread_write(gc, sp_id, "global_pca_features", df_pca_output, mode="clear_update")
 
-        print(f"\n🎯 步驟 3: 啟動預測程序...")
+        print(f"\n🎯 步驟 4: 啟動預測程序...")
         today_str = datetime.now().strftime("%Y-%m-%d")
         
         for sheet_name in TARGET_SHEETS:
@@ -256,9 +282,8 @@ def main():
         print("\n✅ 流程執行完畢！")
         
     except Exception as e:
-        print(f"\n❌ 執行發生錯誤 (白話文診斷):")
+        print(f"\n❌ 執行發生錯誤:")
         print(f"⚠️ {str(e)}\n")
-        print("🔍 原始錯誤 Traceback 如下 (供工程師參考):")
         traceback.print_exc()
 
 if __name__ == "__main__":
