@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-V11.5 PCA_TWII.py (含大盤預測版)
-新增台灣加權指數 (PRE_TWII) 預測，並維持 14 個獨立檔案寫入架構。
+V12.1 PCA_TWII.py (多模型競技版 Model Arena)
+同時執行 PCA+Ridge、RandomForest、XGBoost，評估準確度(RMSE)並進行排名。
+將 3 種模型的結果直接寫入原有的「預測紀錄」分頁中。
 """
 import os
 import sys
@@ -15,7 +16,7 @@ from datetime import datetime
 DATA_LAKE_URL = "" 
 
 TARGET_SPREADSHEETS = {
-    "PRE_TWII": "",         # 🆕 新增：台灣加權指數大盤
+    "PRE_TWII": "",         
     "PRE_台積電(2330)": "",
     "PRE_聯電(2303)": "",
     "PRE_英業達(2356)": "",
@@ -35,11 +36,12 @@ TARGET_SPREADSHEETS = {
 # 【環境自癒與延遲載入】
 # ==========================================
 def bootstrap():
-    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動環境檢查...")
+    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動環境檢查 (包含進階機器學習套件)...")
     dependencies = {
         "pandas": "pandas",
         "numpy": "numpy",
         "sklearn": "scikit-learn",
+        "xgboost": "xgboost",           
         "gspread": "gspread",
         "google.oauth2.service_account": "google-auth",
         "yfinance": "yfinance"
@@ -67,9 +69,14 @@ import re
 import pandas as pd
 import numpy as np
 from datetime import timedelta
+
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+from xgboost import XGBRegressor
+
 import gspread
 from google.oauth2.service_account import Credentials
 import yfinance as yf
@@ -97,15 +104,19 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="clear_update"):
             try:
                 worksheet = sh.worksheet(tab_name)
             except gspread.exceptions.WorksheetNotFound:
+                # 建立新分頁
                 worksheet = sh.add_worksheet(title=tab_name, rows=str(len(df)+50), cols=str(len(df.columns)+5))
             
             df = df.fillna("")
-            data = [df.columns.values.tolist()] + df.values.tolist()
             
             if mode == "clear_update":
+                data = [df.columns.values.tolist()] + df.values.tolist()
                 worksheet.clear()
                 worksheet.update(values=data, range_name=None)
             elif mode == "append":
+                # 如果分頁是空的，先寫入標題
+                if not worksheet.get_all_values():
+                    worksheet.append_row(df.columns.values.tolist())
                 worksheet.append_rows(df.values.tolist())
                 
             return True
@@ -138,9 +149,7 @@ def load_data_lake(sh):
     df = df.ffill().bfill() 
     df.dropna(axis=1, how='all', inplace=True)
     
-    if df.empty:
-        raise ValueError("資料清洗後變成完全空值！")
-        
+    if df.empty: raise ValueError("資料清洗後變成完全空值！")
     return df
 
 def find_independent_spreadsheet(gc, file_name, file_url):
@@ -149,18 +158,13 @@ def find_independent_spreadsheet(gc, file_name, file_url):
             return gc.open_by_url(file_url.strip())
         except Exception:
             return None
-            
-    files = gc.list_spreadsheet_files()
-    for f in files:
+    for f in gc.list_spreadsheet_files():
         if f.get('name') == file_name:
             return gc.open_by_key(f['id'])
     return None
 
-# ==========================================
-# 股票代碼與預測核心
-# ==========================================
 def extract_ticker(file_name):
-    if file_name == "PRE_TWII": return "^TWII"  # 🆕 台灣加權指數的 Yahoo Finance 代碼
+    if file_name == "PRE_TWII": return "^TWII"
     match = re.search(r'\((.*?)\)', file_name)
     if not match: return None
     t = match.group(1)
@@ -168,8 +172,22 @@ def extract_ticker(file_name):
     if t == "7203": return "7203.T"
     return t
 
-def predict_stock_returns(X_pca_df, ticker):
-    start_date = X_pca_df.index.min().strftime('%Y-%m-%d')
+# ==========================================
+# 🚀 核心：多模型競技與評估 (Model Arena)
+# ==========================================
+def predict_with_arena(df_lake, ticker):
+    """
+    執行 PCA、特徵縮放，並讓 3 種模型互相比較準確度
+    """
+    scaler = StandardScaler()
+    X_scaled_np = scaler.fit_transform(df_lake)
+    df_X_scaled = pd.DataFrame(X_scaled_np, index=df_lake.index, columns=df_lake.columns)
+    
+    pca = PCA(n_components=5)
+    X_pca_np = pca.fit_transform(X_scaled_np)
+    df_X_pca = pd.DataFrame(X_pca_np, index=df_lake.index, columns=[f"PC{i+1}" for i in range(5)])
+    
+    start_date = df_lake.index.min().strftime('%Y-%m-%d')
     end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
     stock_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
     
@@ -177,53 +195,92 @@ def predict_stock_returns(X_pca_df, ticker):
     
     y_raw = stock_data['Close']
     if isinstance(y_raw, pd.DataFrame): y_raw = y_raw.iloc[:, 0]
-        
     y_raw.index = pd.to_datetime(y_raw.index)
-    aligned_data = pd.concat([X_pca_df, y_raw.rename("Close")], axis=1).dropna()
     
+    aligned_data = pd.concat([df_X_scaled, df_X_pca, y_raw.rename("Close")], axis=1).dropna()
     if aligned_data.empty: return None
 
-    X_aligned = aligned_data.drop(columns=["Close"]).values
+    model_names = ['PCA_Poly_Ridge', 'RandomForest', 'XGBoost']
+    model_preds = {m: {} for m in model_names}
+    model_errors = {m: [] for m in model_names} 
     
-    predictions = {}
     for window_name, shift_days in WINDOWS.items():
-        # 預測目標：未來 N 天的「報酬率」 (百分比)
         y_target = aligned_data["Close"].pct_change(shift_days).shift(-shift_days) * 100
         valid_idx = ~y_target.isna()
-        X_train = X_aligned[valid_idx]
-        Y_train = y_target[valid_idx].values
         
-        if len(X_train) < 30: 
-            predictions[window_name] = "N/A"
+        if valid_idx.sum() < 60:
+            for m in model_names: model_preds[m][window_name] = "N/A"
             continue
             
+        X_raw_v = aligned_data[df_lake.columns].values[valid_idx]
+        X_pca_v = aligned_data[[f"PC{i+1}" for i in range(5)]].values[valid_idx]
+        Y_v = y_target[valid_idx].values
+        
+        split_idx = int(len(Y_v) * 0.8)
+        
+        X_latest_raw = aligned_data[df_lake.columns].values[-1].reshape(1, -1)
+        X_latest_pca = aligned_data[[f"PC{i+1}" for i in range(5)]].values[-1].reshape(1, -1)
+        
+        # --- 模型 1: PCA + Polynomial + Ridge ---
         poly = PolynomialFeatures(degree=2, include_bias=False)
-        X_train_poly = poly.fit_transform(X_train)
+        X_train_pca_poly = poly.fit_transform(X_pca_v[:split_idx])
+        X_test_pca_poly = poly.transform(X_pca_v[split_idx:])
         
-        model = Ridge(alpha=1.0)
-        model.fit(X_train_poly, Y_train)
+        ridge = Ridge(alpha=1.0)
+        ridge.fit(X_train_pca_poly, Y_v[:split_idx])
+        r_preds_test = ridge.predict(X_test_pca_poly)
+        r_rmse = float(np.sqrt(mean_squared_error(Y_v[split_idx:], r_preds_test)))
         
-        X_latest = X_aligned[-1].reshape(1, -1)
-        X_latest_poly = poly.transform(X_latest)
-        pred_value = model.predict(X_latest_poly)[0]
+        model_errors['PCA_Poly_Ridge'].append(r_rmse)
+        model_preds['PCA_Poly_Ridge'][window_name] = round(float(ridge.predict(poly.transform(X_latest_pca))[0]), 2)
         
-        predictions[window_name] = round(pred_value, 2)
+        # --- 模型 2: Random Forest ---
+        rf = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf.fit(X_raw_v[:split_idx], Y_v[:split_idx])
+        rf_preds_test = rf.predict(X_raw_v[split_idx:])
+        rf_rmse = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf_preds_test)))
         
-    return predictions
+        model_errors['RandomForest'].append(rf_rmse)
+        model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_raw)[0]), 2)
+        
+        # --- 模型 3: XGBoost ---
+        xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror')
+        xgb.fit(X_raw_v[:split_idx], Y_v[:split_idx])
+        xgb_preds_test = xgb.predict(X_raw_v[split_idx:])
+        xgb_rmse = float(np.sqrt(mean_squared_error(Y_v[split_idx:], xgb_preds_test)))
+        
+        model_errors['XGBoost'].append(xgb_rmse)
+        model_preds['XGBoost'][window_name] = round(float(xgb.predict(X_latest_raw)[0]), 2)
+
+    rankings = []
+    for m in model_names:
+        avg_rmse = float(np.mean(model_errors[m])) if model_errors[m] else 9999.99
+        rankings.append({
+            'Model_Name': m,
+            'Eval_Error(RMSE)': round(avg_rmse, 2),
+            'Preds': model_preds[m]
+        })
+        
+    rankings.sort(key=lambda x: x['Eval_Error(RMSE)'])
+    
+    for i, r in enumerate(rankings):
+        r['Rank'] = i + 1
+        
+    return rankings, df_X_pca
 
 # ==========================================
 # 主程式
 # ==========================================
 def main():
     print("="*60)
-    print("🧠 PCA 預測大腦 (含大盤預測版)")
+    print("🏆 PCA x 機器學習 預測大腦 (多模型競技版)")
     print("="*60)
     
     try:
         gc = get_gspread_client()
         lake_sh = None
         
-        print("\n步驟 1: 尋找 Data Lake 試算表...")
+        print("\n步驟 1: 載入 Data Lake...")
         if DATA_LAKE_URL.strip():
             lake_sh = gc.open_by_url(DATA_LAKE_URL.strip())
         else:
@@ -232,63 +289,68 @@ def main():
                     temp_sh = gc.open_by_key(f['id'])
                     temp_sh.worksheet("global_market_factors")
                     lake_sh = temp_sh
-                    print(f"   🎯 找到 Data Lake: {lake_sh.title}")
                     break
                 except Exception:
                     continue
                     
-        if not lake_sh:
-            raise ValueError("找不到包含 'global_market_factors' 的資料湖！")
+        if not lake_sh: raise ValueError("找不到 Data Lake！")
             
-        print("\n步驟 2: 載入並清理 Data Lake...")
         df_lake = load_data_lake(lake_sh)
         print(f"   ✅ 成功載入特徵，資料筆數: {len(df_lake)}")
         
-        print("\n步驟 3: 執行 PCA 降維並寫回 Data Lake...")
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(df_lake)
-        
-        pca = PCA(n_components=5)
-        feats = pca.fit_transform(X_scaled)
-        
-        df_pca = pd.DataFrame(feats, index=df_lake.index, columns=[f"PC{i+1}" for i in range(5)])
-        df_pca_output = df_pca.reset_index()
-        df_pca_output['Date'] = df_pca_output['Date'].dt.strftime('%Y-%m-%d')
-        safe_gspread_write(gc, lake_sh.id, "global_pca_features", df_pca_output, mode="clear_update")
-        print("   ✅ PCA 特徵已儲存回 Data Lake。")
-
-        print(f"\n🎯 步驟 4: 啟動跨檔案預測寫入程序...")
+        print(f"\n🎯 步驟 2: 啟動多模型預測與跨檔案寫入...")
         today_str = datetime.now().strftime("%Y-%m-%d")
+        
+        first_run_pca = None
         
         for file_name, file_url in TARGET_SPREADSHEETS.items():
             print(f"\n👉 處理標的: {file_name}")
             
             target_sh = find_independent_spreadsheet(gc, file_name, file_url)
             if not target_sh:
-                print(f"   ❌ 找不到名為 '{file_name}' 的獨立試算表。")
+                print(f"   ❌ 找不到檔案。")
                 continue
                 
             ticker = extract_ticker(file_name)
             if not ticker: continue
-            preds = predict_stock_returns(df_pca, ticker)
             
-            if preds:
-                row_data = pd.DataFrame([{
+            result = predict_with_arena(df_lake, ticker)
+            if not result:
+                print(f"   ⚠️ 資料不足，跳過。")
+                continue
+                
+            rankings, df_pca_features = result
+            if first_run_pca is None: first_run_pca = df_pca_features
+            
+            rows_to_add = []
+            for r in rankings:
+                rows_to_add.append({
                     "Date": today_str,
-                    "3_Days_Pred(%)": preds.get("3day", "N/A"),
-                    "7_Days_Pred(%)": preds.get("7day", "N/A"),
-                    "1_Month_Pred(%)": preds.get("1month", "N/A"),
-                    "1_Year_Pred(%)": preds.get("1year", "N/A"),
+                    "Rank": r['Rank'],
+                    "Model_Name": r['Model_Name'],
+                    "Eval_Error(RMSE)": r['Eval_Error(RMSE)'],
+                    "3_Days_Pred(%)": r['Preds'].get("3day", "N/A"),
+                    "7_Days_Pred(%)": r['Preds'].get("7day", "N/A"),
+                    "1_Month_Pred(%)": r['Preds'].get("1month", "N/A"),
+                    "1_Year_Pred(%)": r['Preds'].get("1year", "N/A"),
                     "Status": "Success",
                     "Update_Time": datetime.now().strftime("%H:%M:%S")
-                }])
-                
-                if safe_gspread_write(gc, target_sh.id, "預測紀錄", row_data, mode="append"):
-                    print(f"   ✅ 成功寫入獨立檔案 -> {target_sh.title} (分頁: 預測紀錄)")
-                    print(f"   📊 預測結果: 3天[{preds.get('3day')}%], 1月[{preds.get('1month')}%]")
-            else:
-                print(f"   ⚠️ {file_name} 預測失敗或無足夠股票資料。")
+                })
+            
+            df_rows = pd.DataFrame(rows_to_add)
+            
+            # 🔥 直接寫入舊有的「預測紀錄」分頁 🔥
+            if safe_gspread_write(gc, target_sh.id, "預測紀錄", df_rows, mode="append"):
+                best_model = rankings[0]['Model_Name']
+                print(f"   ✅ 成功寫入: {target_sh.title} (分頁: 預測紀錄)")
+                print(f"   🏆 最準確模型: {best_model} (誤差: {rankings[0]['Eval_Error(RMSE)']})")
 
+        if first_run_pca is not None:
+            df_pca_output = first_run_pca.reset_index()
+            df_pca_output['Date'] = df_pca_output['Date'].dt.strftime('%Y-%m-%d')
+            safe_gspread_write(gc, lake_sh.id, "global_pca_features", df_pca_output, mode="clear_update")
+            print("\n✅ PCA 特徵已儲存回 Data Lake。")
+            
         print("\n✅ 所有獨立檔案更新完畢！")
         
     except Exception as e:
