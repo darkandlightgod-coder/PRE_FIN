@@ -1,70 +1,89 @@
 name: 🚀 Financial Analysis Pipeline
 
 on:
-  # 1. 允許隨時手動觸發 (GitHub Actions 頁面會有一個 "Run workflow" 按鈕)
-  workflow_dispatch:
-
-  # 2. 定時任務 (UTC 時間 09:00 即為台灣時間 17:00)
+  workflow_dispatch: # 手動觸發
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 9 * * *' # 每天早上 9 點自動執行
 
 jobs:
-  # --- 並行執行區 (爬蟲任務) ---
-  crawler-1:
+  # 統一安裝環境與快取
+  setup-env:
     runs-on: ubuntu-latest
+    outputs:
+      python-version: '3.10'
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: {python-version: '3.10'}
-      - name: Run Crawler 1
-        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
-        run: python specific_web_index_and_all_number_data_grab.py
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
 
-  crawler-2:
+      - name: 🐍 Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 📦 Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas yfinance gspread google-auth numpy scikit-learn xgboost
+
+  # 爬蟲工作 (並行執行多個腳本)
+  crawler:
+    needs: setup-env
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        script:
+          - specific_web_index_and_all_number_data_grab.py
+          - GLOBAL_Market_Factors.py
+          - web_grab_and_language_AI_score_for_PCA.py
+          - 13_single_stock_grab.py
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: {python-version: '3.10'}
-      - name: Run Crawler 2
-        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
-        run: python GLOBAL_Market_Factors.py
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
 
-  crawler-3:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
+      - name: 🐍 Set up Python
         uses: actions/setup-python@v5
-        with: {python-version: '3.10'}
-      - name: Run Crawler 3
-        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
-        run: python web_grab_and_language_AI_score_for_PCA.py
+        with:
+          python-version: ${{ needs.setup-env.outputs.python-version }}
 
-  crawler-4:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: {python-version: '3.10'}
-      - name: Run Crawler 4
-        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
-        run: python 13_single_stock_grab.py
+      - name: ♻️ Restore pip cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
 
-  # --- 相依執行區 (分析任務) ---
+      - name: 🚀 Run Crawler Script
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+        run: python ${{ matrix.script }}
+
+  # 分析工作
   analysis:
-    needs: [crawler-1, crawler-2, crawler-3, crawler-4]
+    needs: crawler
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
         uses: actions/setup-python@v5
-        with: {python-version: '3.10'}
-      - name: Install Analysis Deps
-        run: pip install pandas numpy sklearn xgboost gspread google-auth
-      - name: Run Prediction Analysis
-        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
+        with:
+          python-version: ${{ needs.setup-env.outputs.python-version }}
+
+      - name: ♻️ Restore pip cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+      - name: 📊 Run Prediction Analysis
+        env:
+          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
         run: python PCA_TWII.py
