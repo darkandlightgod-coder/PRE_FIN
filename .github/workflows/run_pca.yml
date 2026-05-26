@@ -1,32 +1,67 @@
-name: 🧪 Test Specific Stock Grabber
+name: 🚀 Financial Analysis Pipeline
 
 on:
-  workflow_dispatch: # 允許在 GitHub Actions 頁面手動點擊 "Run workflow" 觸發
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *' # 每天固定時間執行
 
 jobs:
-  run-crawler:
+  # --- 並行執行區 (爬蟲任務) ---
+  crawler-1:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: 📥 Checkout Repository (取得程式碼與 CSV)
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: {python-version: '3.10'}
+      - name: Run Crawler 1
+        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
+        run: python specific_web_index_and_all_number_data_grab.py
 
-    - name: 🐍 Set up Python 3.10
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+  crawler-2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: {python-version: '3.10'}
+      - name: Run Crawler 2
+        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
+        run: python GLOBAL_Market_Factors.py
 
-    - name: 📦 Install Required Packages (安裝必要套件)
-      # 雖然您的 Python 腳本內有自癒安裝功能，
-      # 但在 GitHub Actions 中預先安裝可以大幅加快執行速度並避免 Timeout。
-      run: |
-        python -m pip install --upgrade pip
-        pip install pandas yfinance gspread google-auth
-        pip install pandas numpy gspread yfinance google-auth scikit-learn
+  crawler-3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: {python-version: '3.10'}
+      - name: Run Crawler 3
+        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
+        run: python web_grab_and_language_AI_score_for_PCA.py
 
-    - name: 🚀 Run Specific Stock Data Grabber (執行個股與籌碼爬蟲)
-      env:
-        # 將 GitHub Secrets 傳遞給 Python 環境變數
-        GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-      run: |
-        python PCA_TWII.py
+  crawler-4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: {python-version: '3.10'}
+      - name: Run Crawler 4
+        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
+        run: python 13_single_stock_grab.py
+
+  # --- 相依執行區 (分析任務) ---
+  analysis:
+    needs: [crawler-1, crawler-2, crawler-3, crawler-4]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: {python-version: '3.10'}
+      - name: Install Analysis Deps
+        run: pip install pandas numpy sklearn xgboost gspread google-auth
+      - name: Run Prediction Analysis
+        env: {GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}}
+        run: python PCA_TWII.py
