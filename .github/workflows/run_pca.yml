@@ -29,4 +29,4 @@ jobs:
         # 將 GitHub Secrets 傳遞給 Python 環境變數
         GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
       run: |
-        python GLOBAL_Market_Factors.py
+        python PCA_TWII.py
