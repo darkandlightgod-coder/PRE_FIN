@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+"""
+13檔預測標的爬蟲微服務 (Target_Stocks_Data_Lake.py)
+專門負責向 Yahoo Finance 請求 13 檔個股的 5 年歷史股價與成交量，
+並寫入專屬的 Google Sheet 中，供中央大腦作為預測目標 (y) 使用。
+"""
 import os
 import json
 import pandas as pd
@@ -9,25 +14,24 @@ from google.oauth2.service_account import Credentials
 # ==========================================
 # 參數設定區
 # ==========================================
-SHEET_NAME = "global_market_factors"
+SHEET_NAME = "stock_history_13_targets"  # 獨立的 13 檔標的資料湖
 PERIOD = "5y"  # 初始抓取五年資料
 
-# 預設要抓取的全球市場指標 (共 19 項)
+# 預設要抓取的 13 檔預測標的 (對應大腦預期的欄位)
 TARGET_TICKERS = [
-    # --- 全球主要指數與風險指標 ---
-    "^GSPC", "^IXIC", "^DJI", "^SOX", "^VIX",
-    # --- 總體經濟與債券 ---
-    "^TNX", "DX-Y.NYB",
-    # --- 能源與貴金屬 ---
-    "GC=F", "CL=F",
-    # --- 食物與農產品期貨 ---
-    "ZC=F", "ZW=F", "ZS=F",
-    # --- 運價指標 ---
-    "BDRY",
-    # --- 重要匯率 (對美元) ---
-    "TWD=X", "EURUSD=X", "JPY=X", "CNY=X",
-    # --- 虛擬貨幣 ---
-    "BTC-USD", "ETH-USD"
+    "2330.TW",  # 台積電
+    "2303.TW",  # 聯電
+    "2356.TW",  # 英業達
+    "2002.TW",  # 中鋼
+    "NVDA",     # NVIDIA
+    "TSLA",     # TESLA
+    "INTC",     # INTEL
+    "AAPL",     # Apple
+    "MSFT",     # Microsoft
+    "AMZN",     # Amazon
+    "LLY",      # Eli Lilly
+    "NVO",      # Novo Nordisk
+    "7203.T"    # Toyota
 ]
 
 def extract_series_safely(df, ticker, is_multi):
@@ -36,19 +40,22 @@ def extract_series_safely(df, ticker, is_multi):
         return pd.Series(dtype=float), pd.Series(dtype=float)
     
     try:
+        # yfinance 新版回傳 MultiIndex，利用 KeyError 捕捉取代 in 判斷更安全
         if is_multi:
-            close_s = df['Close'][ticker] if 'Close' in df else pd.Series(dtype=float)
-            vol_s = df['Volume'][ticker] if 'Volume' in df else pd.Series(dtype=float)
+            close_s = df['Close'][ticker]
+            vol_s = df['Volume'][ticker]
         else:
-            close_s = df['Close'] if 'Close' in df else pd.Series(dtype=float)
-            vol_s = df['Volume'] if 'Volume' in df else pd.Series(dtype=float)
+            close_s = df['Close']
+            vol_s = df['Volume']
         return close_s, vol_s
+    except KeyError:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
     except Exception:
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
 def main():
     print("===========================================")
-    print(f"🌍 啟動【全球市場因子】無污染純淨數據任務 (期間: {PERIOD})")
+    print(f"🎯 啟動【13檔預測標的】無污染純淨數據任務 (期間: {PERIOD})")
     print("===========================================")
 
     # ------------------------------------------------
@@ -66,6 +73,7 @@ def main():
     
     for ticker in TARGET_TICKERS:
         close_series, vol_series = extract_series_safely(df_bulk, ticker, is_multi)
+        # 欄位命名規則：Ticker_Close (這正是 PCA 大腦需要的名稱)
         merged_df[f"{ticker}_Close"] = close_series
         merged_df[f"{ticker}_Volume"] = vol_series
 
@@ -89,8 +97,8 @@ def main():
     merged_df.index.name = 'Date'
     merged_df = merged_df.reset_index()
     
-    # 將日期格式化為字串 YYYY-MM-DD
-    merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.strftime('%Y-%m-%d')
+    # 統一將 Date 轉為 YYYY-MM-DD 並去除時區，以利後續合併
+    merged_df['Date'] = pd.to_datetime(merged_df['Date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
     
     # 交易量防呆處理：有數值的轉整數(去掉.0)，沒有數值的(NaN)轉為空字串 ""
     for col in vol_cols:
@@ -119,14 +127,17 @@ def main():
     try:
         sh = gc.open(SHEET_NAME)
         wks = sh.sheet1
+    except gspread.exceptions.SpreadsheetNotFound:
+        print(f"❌ 找不到檔案 [{SHEET_NAME}]！請先在 Google Drive 手動建立一個名為 '{SHEET_NAME}' 的空白試算表。")
+        return
     except Exception as e:
-        print(f"❌ 讀取失敗，請確認已在 Google Drive 建立名為 '{SHEET_NAME}' 的試算表。錯誤: {e}")
+        print(f"❌ 讀取失敗，錯誤: {e}")
         return
 
     try:
         print("   正在清空舊表並寫入全新的巨量資料...")
         wks.clear()
-        wks.update(range_name="A1", values=output_data) 
+        wks.update("A1", output_data) 
         print(f"   🎉 任務完成！共寫入 {len(output_data)} 列高純度市場資料！")
     except Exception as e:
         print(f"❌ 寫回 Google Sheet 失敗: {e}")
