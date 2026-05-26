@@ -1,9 +1,12 @@
 name: 🚀 Financial Analysis Pipeline
 
 on:
+  # 1. 允許隨時手動觸發 (GitHub Actions 頁面會有一個 "Run workflow" 按鈕)
   workflow_dispatch:
+
+  # 2. 定時任務 (UTC 時間 09:00 即為台灣時間 17:00)
   schedule:
-    - cron: '0 0 * * *' # 每天固定時間執行
+    - cron: '0 9 * * *'
 
 jobs:
   # --- 並行執行區 (爬蟲任務) ---
