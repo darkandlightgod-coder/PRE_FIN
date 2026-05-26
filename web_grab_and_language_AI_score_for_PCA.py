@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-V11.1 PCA_TWII.py (Lightweight / No Matplotlib)
+V11.2 PCA_TWII.py (Lightweight / No Matplotlib)
 移除多餘的畫圖套件，專注於 PCA 運算、多項式預測與成交金額轉換。
 非常適合在 GitHub Actions 等 CI/CD 雲端環境執行。
 """
@@ -53,7 +53,7 @@ def safe_gspread_write(gc, spreadsheet_id, sheet_name, df, mode="append", matrix
         if mode == "clear_update":
             wks.clear()
             wks.update("A1", [df_clean.columns.tolist()] + df_clean.values.tolist())
-            print(f"🟢 {sheet_name} 覆寫成功 (全域 PCA 特徵)")
+            print(f"🟢 {sheet_name} 覆寫成功")
         elif mode == "append":
             existing = wks.get_all_values()
             if not existing:
