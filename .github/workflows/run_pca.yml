@@ -1,99 +1,32 @@
-name: 🚀 Financial Analysis Pipeline
+name: 🧪 Test Specific Stock Grabber
 
 on:
-  workflow_dispatch: # 手動觸發
-  schedule:
-    - cron: '0 9 * * *' # 每天早上 9 點自動執行
+  workflow_dispatch: # 允許在 GitHub Actions 頁面手動點擊 "Run workflow" 觸發
 
 jobs:
-  # 統一安裝環境與快取
-  setup-env:
+  run-crawler:
     runs-on: ubuntu-latest
-    outputs:
-      python-version: '3.10'
+    
     steps:
-      - name: 📥 Checkout Repository
-        uses: actions/checkout@v4
+    - name: 📥 Checkout Repository (取得程式碼與 CSV)
+      uses: actions/checkout@v4
 
-      - name: 🐍 Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+    - name: 🐍 Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
 
-      - name: 📦 Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+    - name: 📦 Install Required Packages (安裝必要套件)
+      # 雖然您的 Python 腳本內有自癒安裝功能，
+      # 但在 GitHub Actions 中預先安裝可以大幅加快執行速度並避免 Timeout。
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas yfinance gspread google-auth
+        pip install pandas numpy gspread yfinance google-auth scikit-learn
 
-      - name: 📦 Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-  # 爬蟲工作 (並行執行多個腳本)
-  crawler:
-    needs: setup-env
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        script:
-          - specific_web_index_and_all_number_data_grab.py
-          - GLOBAL_Market_Factors.py
-          - web_grab_and_language_AI_score_for_PCA.py
-          - 13_single_stock_grab.py
-    steps:
-      - name: 📥 Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: 🐍 Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ needs.setup-env.outputs.python-version }}
-
-      - name: ♻️ Restore pip cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-
-      - name: 📦 Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: 🚀 Run Crawler Script
-        env:
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-        run: python ${{ matrix.script }}
-
-  # 分析工作
-  analysis:
-    needs: crawler
-    runs-on: ubuntu-latest
-    steps:
-      - name: 📥 Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: 🐍 Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ needs.setup-env.outputs.python-version }}
-
-      - name: ♻️ Restore pip cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-
-      - name: 📦 Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: 📊 Run Prediction Analysis
-        env:
-          GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
-        run: python PCA_TWII.py
+    - name: 🚀 Run Specific Stock Data Grabber (執行個股與籌碼爬蟲)
+      env:
+        # 將 GitHub Secrets 傳遞給 Python 環境變數
+        GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
+      run: |
+        python PCA_TWII.py
