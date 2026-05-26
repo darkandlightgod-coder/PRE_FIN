@@ -29,7 +29,7 @@ TARGET_SPREADSHEETS = {
     "PRE_Amazon(AMZN)": "",
     "PRE_Eli Lilly(LLY)": "",
     "PRE_Novo Nordisk(NVO)": "",
-    "PRE_Toyota(7203)": ""
+    "PRE_Toyota(7203.T)": ""
 }
 
 # ==========================================
