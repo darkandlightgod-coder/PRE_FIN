@@ -28,36 +28,27 @@ PERIOD = "5y"  # 初始抓取五年資料
 
 # 預設要抓取的全球市場指標 (共 19 項)
 
+# 預設要抓取的全球市場指標 (已補上台灣加權指數與 MSCI)
 TARGET_TICKERS = [
+    # --- 🆕 新增：台灣大盤與 MSCI 指標 ---
+    "^TWII",    # 台灣加權指數 (Taiwan Weighted Index)
+    "EWT",      # iShares MSCI Taiwan ETF (MSCI 台灣指數代理標的)
+    "URTH",     # iShares MSCI World ETF (MSCI 全球指數代理標的)
 
     # --- 全球主要指數與風險指標 ---
-
     "^GSPC", "^IXIC", "^DJI", "^SOX", "^VIX",
-
     # --- 總體經濟與債券 ---
-
     "^TNX", "DX-Y.NYB",
-
     # --- 能源與貴金屬 ---
-
     "GC=F", "CL=F",
-
     # --- 食物與農產品期貨 ---
-
     "ZC=F", "ZW=F", "ZS=F",
-
     # --- 運價指標 ---
-
     "BDRY",
-
     # --- 重要匯率 (對美元) ---
-
     "TWD=X", "EURUSD=X", "JPY=X", "CNY=X",
-
     # --- 虛擬貨幣 ---
-
     "BTC-USD", "ETH-USD"
-
 ]
 
 
