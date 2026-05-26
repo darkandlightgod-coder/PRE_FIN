@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-V11.3 PCA_TWII.py (精準定位版)
-解決抓錯試算表的問題，加入智慧檔案掃描機制，並支援直接輸入網址。
+V11.4 PCA_TWII.py (多檔案獨立寫入版)
+將 13 檔標的預測結果，分別寫入 13 個獨立的 Google Sheet 檔案中。
 """
 import os
 import sys
@@ -10,14 +10,33 @@ import importlib
 from datetime import datetime
 
 # ==========================================
-# 💡 終極解法：您可以直接把試算表網址貼在下面引號內！
-# 如果留空 ""，程式就會自動啟動「智慧尋找機制」
+# 【設定區：資料湖與獨立檔案網址】
 # ==========================================
-SPREADSHEET_URL = "" 
+# 1. 您的 Data Lake (包含 global_market_factors) 網址
+# (若留空 ""，程式會自動掃描尋找)
+DATA_LAKE_URL = "" 
 
+# 2. 13 個獨立檔案的對應設定
+# 您可以將每一個獨立 Google Sheet 的網址填入後方的引號中。
+# 如果留空 ""，程式會自動在服務帳戶中尋找「檔名一模一樣」的檔案。
+TARGET_SPREADSHEETS = {
+    "PRE_台積電(2330)": "",
+    "PRE_聯電(2303)": "",
+    "PRE_英業達(2356)": "",
+    "PRE_中鋼(2002)": "",
+    "PRE_NVIDIA(NVDA)": "",
+    "PRE_TESLA(TSLA)": "",
+    "PRE_INTEL(INTC)": "",
+    "PRE_Apple(AAPL)": "",
+    "PRE_Microsoft(MSFT)": "",
+    "PRE_Amazon(AMZN)": "",
+    "PRE_Eli Lilly(LLY)": "",
+    "PRE_Novo Nordisk(NVO)": "",
+    "PRE_Toyota(7203)": ""
+}
 
 # ==========================================
-# 【0. 環境自癒與延遲載入】
+# 【環境自癒與延遲載入】
 # ==========================================
 def bootstrap():
     print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動環境檢查...")
@@ -59,13 +78,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 import yfinance as yf
 
-TARGET_SHEETS = [
-    "PRE_台積電(2330)", "PRE_聯電(2303)", "PRE_英業達(2356)", "PRE_中鋼(2002)",
-    "PRE_NVIDIA(NVDA)", "PRE_TESLA(TSLA)", "PRE_INTEL(INTC)", "PRE_Apple(AAPL)",
-    "PRE_Microsoft(MSFT)", "PRE_Amazon(AMZN)", "PRE_Eli Lilly(LLY)", "PRE_Novo Nordisk(NVO)",
-    "PRE_Toyota(7203)"
-]
-
 WINDOWS = {"3day": 3, "7day": 7, "1month": 22, "1year": 252}
 
 # ==========================================
@@ -81,15 +93,15 @@ def get_gspread_client():
         creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
     return gspread.authorize(creds)
 
-def safe_gspread_write(gc, sp_id, sheet_name, df, mode="clear_update"):
+def safe_gspread_write(gc, sp_id, tab_name, df, mode="clear_update"):
     max_retries = 3
     for attempt in range(max_retries):
         try:
             sh = gc.open_by_key(sp_id)
             try:
-                worksheet = sh.worksheet(sheet_name)
+                worksheet = sh.worksheet(tab_name)
             except gspread.exceptions.WorksheetNotFound:
-                worksheet = sh.add_worksheet(title=sheet_name, rows=str(len(df)+50), cols=str(len(df.columns)+5))
+                worksheet = sh.add_worksheet(title=tab_name, rows=str(len(df)+50), cols=str(len(df.columns)+5))
             
             df = df.fillna("")
             data = [df.columns.values.tolist()] + df.values.tolist()
@@ -100,15 +112,12 @@ def safe_gspread_write(gc, sp_id, sheet_name, df, mode="clear_update"):
             elif mode == "append":
                 worksheet.append_rows(df.values.tolist())
                 
-            print(f"   ✅ 成功寫入: {sheet_name}")
             return True
         except Exception as e:
-            print(f"   ⚠️ 寫入失敗 (嘗試 {attempt+1}): {e}")
             time.sleep(2)
     return False
 
 def load_data_lake(sh):
-    """讀取並強化清理資料湖 (具備防呆機制)"""
     try:
         ws = sh.worksheet("global_market_factors")
     except gspread.exceptions.WorksheetNotFound:
@@ -116,41 +125,49 @@ def load_data_lake(sh):
         
     data = ws.get_all_values()
     if not data or len(data) < 2:
-        raise ValueError("分頁 'global_market_factors' 沒有資料或只有標題！無法進行 PCA 分析。")
+        raise ValueError("分頁 'global_market_factors' 沒有資料或只有標題！")
         
     df = pd.DataFrame(data[1:], columns=data[0])
     
-    # 防呆：尋找 Date 欄位
     if 'Date' not in df.columns:
         if '日期' in df.columns:
             df.rename(columns={'日期': 'Date'}, inplace=True)
-            print("   ⚠️ 發現欄位名稱為 '日期'，已自動轉換為 'Date'")
         else:
             first_col = df.columns[0]
             df.rename(columns={first_col: 'Date'}, inplace=True)
-            print(f"   ⚠️ 找不到 Date 欄位，強制將第一欄 '{first_col}' 視為 Date")
     
-    try:
-        df['Date'] = pd.to_datetime(df['Date'])
-    except Exception as e:
-        raise ValueError(f"日期格式轉換失敗！請檢查 Date 欄位。錯誤: {e}")
-        
+    df['Date'] = pd.to_datetime(df['Date'])
     df.set_index('Date', inplace=True)
     df = df.apply(pd.to_numeric, errors='coerce')
     df = df.ffill().bfill() 
-    
     df.dropna(axis=1, how='all', inplace=True)
     
     if df.empty:
-        raise ValueError("資料清洗後變成完全空值！請檢查表內資料。")
+        raise ValueError("資料清洗後變成完全空值！")
         
     return df
+
+def find_independent_spreadsheet(gc, file_name, file_url):
+    """根據網址或檔名，尋找獨立的 Google Sheet 檔案"""
+    if file_url.strip():
+        try:
+            return gc.open_by_url(file_url.strip())
+        except Exception:
+            return None
+            
+    # 網址為空時，搜尋服務帳戶內的檔案名稱
+    files = gc.list_spreadsheet_files()
+    for f in files:
+        if f.get('name') == file_name:
+            return gc.open_by_key(f['id'])
+            
+    return None
 
 # ==========================================
 # 股票代碼與預測核心
 # ==========================================
-def extract_ticker(sheet_name):
-    match = re.search(r'\((.*?)\)', sheet_name)
+def extract_ticker(file_name):
+    match = re.search(r'\((.*?)\)', file_name)
     if not match: return None
     t = match.group(1)
     if t.isdigit() and len(t) == 4: return f"{t}.TW"
@@ -204,45 +221,35 @@ def predict_stock_returns(X_pca_df, ticker):
 # ==========================================
 def main():
     print("="*60)
-    print("🧠 PCA 預測大腦 (精準定位版)")
+    print("🧠 PCA 預測大腦 (多檔案獨立寫入版)")
     print("="*60)
     
     try:
         gc = get_gspread_client()
-        target_sh = None
+        lake_sh = None
         
-        print("\n步驟 1: 定位資料湖試算表...")
-        
-        if SPREADSHEET_URL.strip():
-            print("   🔗 偵測到手動輸入網址，嘗試連線...")
-            target_sh = gc.open_by_url(SPREADSHEET_URL.strip())
+        print("\n步驟 1: 尋找 Data Lake 試算表...")
+        if DATA_LAKE_URL.strip():
+            lake_sh = gc.open_by_url(DATA_LAKE_URL.strip())
         else:
-            print("   🔍 啟動智慧掃描，尋找包含 'global_market_factors' 的檔案...")
-            files = gc.list_spreadsheet_files()
-            if not files:
-                raise ValueError("服務帳戶沒有權限存取任何試算表！")
-                
-            for f in files:
+            for f in gc.list_spreadsheet_files():
                 try:
                     temp_sh = gc.open_by_key(f['id'])
-                    # 測試有沒有這個分頁
                     temp_sh.worksheet("global_market_factors")
-                    target_sh = temp_sh
-                    print(f"   🎯 找到了！正確的檔案是: {target_sh.title}")
+                    lake_sh = temp_sh
+                    print(f"   🎯 找到 Data Lake: {lake_sh.title}")
                     break
                 except Exception:
                     continue
                     
-        if not target_sh:
-            raise ValueError("掃描完所有檔案，都找不到 'global_market_factors'！\n請確認：1. 爬蟲是否成功寫入資料？ 2. 或是將網址直接貼到程式的 SPREADSHEET_URL 變數中！")
+        if not lake_sh:
+            raise ValueError("找不到包含 'global_market_factors' 的資料湖！")
             
-        sp_id = target_sh.id
-        
-        print("\n步驟 2: 載入並清理資料湖 (Data Lake)...")
-        df_lake = load_data_lake(target_sh)
+        print("\n步驟 2: 載入並清理 Data Lake...")
+        df_lake = load_data_lake(lake_sh)
         print(f"   ✅ 成功載入特徵，資料筆數: {len(df_lake)}")
         
-        print("\n步驟 3: 執行全局 PCA 降維萃取大盤核心情緒...")
+        print("\n步驟 3: 執行 PCA 降維並寫回 Data Lake...")
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df_lake)
         
@@ -252,18 +259,28 @@ def main():
         df_pca = pd.DataFrame(feats, index=df_lake.index, columns=[f"PC{i+1}" for i in range(5)])
         df_pca_output = df_pca.reset_index()
         df_pca_output['Date'] = df_pca_output['Date'].dt.strftime('%Y-%m-%d')
-        safe_gspread_write(gc, sp_id, "global_pca_features", df_pca_output, mode="clear_update")
+        safe_gspread_write(gc, lake_sh.id, "global_pca_features", df_pca_output, mode="clear_update")
+        print("   ✅ PCA 特徵已儲存回 Data Lake。")
 
-        print(f"\n🎯 步驟 4: 啟動預測程序...")
+        print(f"\n🎯 步驟 4: 啟動跨檔案預測寫入程序...")
         today_str = datetime.now().strftime("%Y-%m-%d")
         
-        for sheet_name in TARGET_SHEETS:
-            print(f"\n👉 處理標的: {sheet_name}")
-            ticker = extract_ticker(sheet_name)
-            if not ticker: continue
+        for file_name, file_url in TARGET_SPREADSHEETS.items():
+            print(f"\n👉 處理標的: {file_name}")
+            
+            # 1. 尋找獨立檔案
+            target_sh = find_independent_spreadsheet(gc, file_name, file_url)
+            if not target_sh:
+                print(f"   ❌ 找不到名為 '{file_name}' 的獨立試算表。")
+                print(f"   💡 解法: 請確認有建立此檔案並共用給服務帳戶，或直接將網址填入程式碼的 TARGET_SPREADSHEETS 中！")
+                continue
                 
+            # 2. 執行預測
+            ticker = extract_ticker(file_name)
+            if not ticker: continue
             preds = predict_stock_returns(df_pca, ticker)
             
+            # 3. 寫入該獨立檔案內的 "預測紀錄" 分頁
             if preds:
                 row_data = pd.DataFrame([{
                     "Date": today_str,
@@ -274,16 +291,18 @@ def main():
                     "Status": "Success",
                     "Update_Time": datetime.now().strftime("%H:%M:%S")
                 }])
-                safe_gspread_write(gc, sp_id, sheet_name, row_data, mode="append")
-                print(f"   📊 預測結果: 3天[{preds.get('3day')}%], 1月[{preds.get('1month')}%]")
+                
+                # 寫入名為 "預測紀錄" 的分頁 (如果沒有會自動建立)
+                if safe_gspread_write(gc, target_sh.id, "預測紀錄", row_data, mode="append"):
+                    print(f"   ✅ 成功寫入獨立檔案 -> {target_sh.title} (分頁: 預測紀錄)")
+                    print(f"   📊 預測結果: 3天[{preds.get('3day')}%], 1月[{preds.get('1month')}%]")
             else:
-                print(f"   ⚠️ {sheet_name} 預測失敗或無足夠資料。")
+                print(f"   ⚠️ {file_name} 預測失敗或無足夠股票資料。")
 
-        print("\n✅ 流程執行完畢！")
+        print("\n✅ 所有獨立檔案更新完畢！")
         
     except Exception as e:
-        print(f"\n❌ 執行發生錯誤:")
-        print(f"⚠️ {str(e)}\n")
+        print(f"\n❌ 執行發生錯誤:\n⚠️ {str(e)}\n")
         traceback.print_exc()
 
 if __name__ == "__main__":
