@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-V12.2 PCA_TWII.py (多模型競技版 Model Arena - 智慧標題覆蓋)
-同時執行 PCA+Ridge、RandomForest、XGBoost，評估準確度(RMSE)並進行排名。
-自動偵測舊版格式並覆蓋，確保擁有正確的欄位名稱。
+V13.0 PCA_TWII.py (多模型競技場 - 5層獨立評估版)
+將評估維度拆分為 3天、7天、1個月、1年、以及 Overall(整體) 共 5 層。
+每個模型在不同時間維度會有獨立的 RMSE 誤差與排名，讓優劣勢無所遁形。
 """
 import os
 import sys
@@ -104,7 +104,6 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
             try:
                 worksheet = sh.worksheet(tab_name)
             except gspread.exceptions.WorksheetNotFound:
-                # 建立新分頁
                 worksheet = sh.add_worksheet(title=tab_name, rows=str(len(df)+50), cols=str(len(df.columns)+5))
             
             df = df.fillna("")
@@ -119,15 +118,12 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
                 existing_data = worksheet.get_all_values()
                 
                 if not existing_data:
-                    # 分頁全空，先寫入標題
                     worksheet.append_row(new_headers)
                 elif existing_data[0] != new_headers:
-                    # 💡 智慧偵測：如果舊的標題跟新標題不一樣，代表是舊格式，直接清空並寫入新標題
-                    print("     🧹 偵測到舊版格式，清空並覆寫新標題...")
+                    print("     🧹 偵測到欄位格式變更 (更新為 5 層評估版)，清空並覆寫新標題...")
                     worksheet.clear()
                     worksheet.append_row(new_headers)
                 
-                # 接著寫入今天的多模型預測資料
                 worksheet.append_rows(df.values.tolist())
                 
             return True
@@ -184,9 +180,9 @@ def extract_ticker(file_name):
     return t
 
 # ==========================================
-# 🚀 核心：多模型競技與評估 (Model Arena)
+# 🚀 核心：5層矩陣競技與評估 (Layered Model Arena)
 # ==========================================
-def predict_with_arena(df_lake, ticker):
+def predict_with_layered_arena(df_lake, ticker):
     scaler = StandardScaler()
     X_scaled_np = scaler.fit_transform(df_lake)
     df_X_scaled = pd.DataFrame(X_scaled_np, index=df_lake.index, columns=df_lake.columns)
@@ -209,15 +205,19 @@ def predict_with_arena(df_lake, ticker):
     if aligned_data.empty: return None
 
     model_names = ['PCA_Poly_Ridge', 'RandomForest', 'XGBoost']
+    
+    # 資料容器：以模型為 Key，記錄每個 window 的 Pred 與 RMSE
     model_preds = {m: {} for m in model_names}
-    model_errors = {m: [] for m in model_names} 
+    model_rmse = {m: {} for m in model_names} 
     
     for window_name, shift_days in WINDOWS.items():
         y_target = aligned_data["Close"].pct_change(shift_days).shift(-shift_days) * 100
         valid_idx = ~y_target.isna()
         
         if valid_idx.sum() < 60:
-            for m in model_names: model_preds[m][window_name] = "N/A"
+            for m in model_names: 
+                model_preds[m][window_name] = "N/A"
+                model_rmse[m][window_name] = None
             continue
             
         X_raw_v = aligned_data[df_lake.columns].values[valid_idx]
@@ -229,7 +229,7 @@ def predict_with_arena(df_lake, ticker):
         X_latest_raw = aligned_data[df_lake.columns].values[-1].reshape(1, -1)
         X_latest_pca = aligned_data[[f"PC{i+1}" for i in range(5)]].values[-1].reshape(1, -1)
         
-        # --- 模型 1: PCA + Polynomial + Ridge ---
+        # --- 獨立層級模型 1: PCA + Polynomial + Ridge ---
         poly = PolynomialFeatures(degree=2, include_bias=False)
         X_train_pca_poly = poly.fit_transform(X_pca_v[:split_idx])
         X_test_pca_poly = poly.transform(X_pca_v[split_idx:])
@@ -237,51 +237,68 @@ def predict_with_arena(df_lake, ticker):
         ridge = Ridge(alpha=1.0)
         ridge.fit(X_train_pca_poly, Y_v[:split_idx])
         r_preds_test = ridge.predict(X_test_pca_poly)
-        r_rmse = float(np.sqrt(mean_squared_error(Y_v[split_idx:], r_preds_test)))
-        
-        model_errors['PCA_Poly_Ridge'].append(r_rmse)
+        model_rmse['PCA_Poly_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], r_preds_test)))
         model_preds['PCA_Poly_Ridge'][window_name] = round(float(ridge.predict(poly.transform(X_latest_pca))[0]), 2)
         
-        # --- 模型 2: Random Forest ---
+        # --- 獨立層級模型 2: Random Forest ---
         rf = RandomForestRegressor(n_estimators=100, random_state=42)
         rf.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         rf_preds_test = rf.predict(X_raw_v[split_idx:])
-        rf_rmse = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf_preds_test)))
-        
-        model_errors['RandomForest'].append(rf_rmse)
+        model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf_preds_test)))
         model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_raw)[0]), 2)
         
-        # --- 模型 3: XGBoost ---
+        # --- 獨立層級模型 3: XGBoost ---
         xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror')
         xgb.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         xgb_preds_test = xgb.predict(X_raw_v[split_idx:])
-        xgb_rmse = float(np.sqrt(mean_squared_error(Y_v[split_idx:], xgb_preds_test)))
-        
-        model_errors['XGBoost'].append(xgb_rmse)
+        model_rmse['XGBoost'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], xgb_preds_test)))
         model_preds['XGBoost'][window_name] = round(float(xgb.predict(X_latest_raw)[0]), 2)
 
-    rankings = []
-    for m in model_names:
-        avg_rmse = float(np.mean(model_errors[m])) if model_errors[m] else 9999.99
-        rankings.append({
-            'Model_Name': m,
-            'Eval_Error(RMSE)': round(avg_rmse, 2),
-            'Preds': model_preds[m]
-        })
-        
-    rankings.sort(key=lambda x: x['Eval_Error(RMSE)'])
+    # ----------------------------------------------------
+    # 計算第五層 (Overall / 所有資料綜合誤差)
+    # ----------------------------------------------------
+    layers = list(WINDOWS.keys()) + ['Overall']
     
-    for i, r in enumerate(rankings):
-        r['Rank'] = i + 1
+    for m in model_names:
+        # 取出該模型所有合法的各層 RMSE
+        valid_rmses = [rmse for w, rmse in model_rmse[m].items() if rmse is not None]
+        if valid_rmses:
+            model_rmse[m]['Overall'] = float(np.mean(valid_rmses))
+        else:
+            model_rmse[m]['Overall'] = None
+
+    # ----------------------------------------------------
+    # 進行各層獨立排序 (Ranking)
+    # ----------------------------------------------------
+    model_ranks = {m: {} for m in model_names}
+    
+    for layer in layers:
+        # 將模型依照該層的 RMSE 排序 (排除 None 的情況)，RMSE 越小越前
+        sorted_models = sorted(
+            model_names, 
+            key=lambda m: model_rmse[m].get(layer) if model_rmse[m].get(layer) is not None else 9999.99
+        )
         
-    return rankings, df_X_pca
+        for rank, m in enumerate(sorted_models, 1):
+            model_ranks[m][layer] = rank
+
+    # 整理為回傳結構
+    results = {}
+    for m in model_names:
+        results[m] = {
+            'Preds': model_preds[m],
+            'RMSE': model_rmse[m],
+            'Ranks': model_ranks[m]
+        }
+        
+    return results, df_X_pca
 
 # ==========================================
 # 主程式
 # ==========================================
 def main():
     print("="*60)
-    print("🏆 PCA x 機器學習 預測大腦 (多模型競技版)")
+    print("🏆 PCA x 機器學習 (5 層矩陣獨立評估版)")
     print("="*60)
     
     try:
@@ -306,7 +323,7 @@ def main():
         df_lake = load_data_lake(lake_sh)
         print(f"   ✅ 成功載入特徵，資料筆數: {len(df_lake)}")
         
-        print(f"\n🎯 步驟 2: 啟動多模型預測與跨檔案寫入...")
+        print(f"\n🎯 步驟 2: 啟動多模型分層預測與跨檔案寫入...")
         today_str = datetime.now().strftime("%Y-%m-%d")
         
         first_run_pca = None
@@ -322,36 +339,61 @@ def main():
             ticker = extract_ticker(file_name)
             if not ticker: continue
             
-            result = predict_with_arena(df_lake, ticker)
+            result = predict_with_layered_arena(df_lake, ticker)
             if not result:
                 print(f"   ⚠️ 資料不足，跳過。")
                 continue
                 
-            rankings, df_pca_features = result
+            layered_results, df_pca_features = result
             if first_run_pca is None: first_run_pca = df_pca_features
             
+            # 依照「第五層 (Overall)」的綜合排名，決定輸出的順序 (綜合最強的在最上面)
+            sorted_model_names = sorted(layered_results.keys(), key=lambda m: layered_results[m]['Ranks'].get('Overall', 99))
+            
             rows_to_add = []
-            for r in rankings:
+            for m in sorted_model_names:
+                res = layered_results[m]
+                
+                def get_val(d, k, default="N/A", is_round=True):
+                    val = d.get(k)
+                    if val is None: return default
+                    return round(val, 2) if is_round else val
+                
                 rows_to_add.append({
                     "Date": today_str,
-                    "Rank": r['Rank'],
-                    "Model_Name": r['Model_Name'],
-                    "Eval_Error(RMSE)": r['Eval_Error(RMSE)'],
-                    "3_Days_Pred(%)": r['Preds'].get("3day", "N/A"),
-                    "7_Days_Pred(%)": r['Preds'].get("7day", "N/A"),
-                    "1_Month_Pred(%)": r['Preds'].get("1month", "N/A"),
-                    "1_Year_Pred(%)": r['Preds'].get("1year", "N/A"),
+                    "Model_Name": m,
+                    # 第五層: Overall (綜合所有資料)
+                    "Overall_Rank": get_val(res['Ranks'], 'Overall', is_round=False),
+                    "Overall_RMSE": get_val(res['RMSE'], 'Overall'),
+                    # 第一層: 3 天
+                    "3D_Rank": get_val(res['Ranks'], '3day', is_round=False),
+                    "3D_RMSE": get_val(res['RMSE'], '3day'),
+                    "3_Days_Pred(%)": get_val(res['Preds'], '3day'),
+                    # 第二層: 7 天
+                    "7D_Rank": get_val(res['Ranks'], '7day', is_round=False),
+                    "7D_RMSE": get_val(res['RMSE'], '7day'),
+                    "7_Days_Pred(%)": get_val(res['Preds'], '7day'),
+                    # 第三層: 1 個月 (22交易日)
+                    "1M_Rank": get_val(res['Ranks'], '1month', is_round=False),
+                    "1M_RMSE": get_val(res['RMSE'], '1month'),
+                    "1_Month_Pred(%)": get_val(res['Preds'], '1month'),
+                    # 第四層: 1 年 (252交易日)
+                    "1Y_Rank": get_val(res['Ranks'], '1year', is_round=False),
+                    "1Y_RMSE": get_val(res['RMSE'], '1year'),
+                    "1_Year_Pred(%)": get_val(res['Preds'], '1year'),
+                    
                     "Status": "Success",
                     "Update_Time": datetime.now().strftime("%H:%M:%S")
                 })
             
             df_rows = pd.DataFrame(rows_to_add)
             
-            # 使用 append 模式，裡面會智慧判斷需不需要清空舊版標題
             if safe_gspread_write(gc, target_sh.id, "預測紀錄", df_rows, mode="append"):
-                best_model = rankings[0]['Model_Name']
-                print(f"   ✅ 成功寫入: {target_sh.title} (分頁: 預測紀錄)")
-                print(f"   🏆 最準確模型: {best_model} (誤差: {rankings[0]['Eval_Error(RMSE)']})")
+                print(f"   ✅ 成功寫入 5 層評估報告: {target_sh.title}")
+                best_3d = sorted(layered_results.keys(), key=lambda m: layered_results[m]['Ranks'].get('3day', 99))[0]
+                best_1y = sorted(layered_results.keys(), key=lambda m: layered_results[m]['Ranks'].get('1year', 99))[0]
+                print(f"   🏆 3天短線最準模型: {best_3d} (RMSE: {round(layered_results[best_3d]['RMSE'].get('3day',0),2)})")
+                print(f"   🏆 1年長線最準模型: {best_1y} (RMSE: {round(layered_results[best_1y]['RMSE'].get('1year',0),2)})")
 
         if first_run_pca is not None:
             df_pca_output = first_run_pca.reset_index()
