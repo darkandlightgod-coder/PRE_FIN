@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-V12.1 PCA_TWII.py (增強錯誤追蹤版)
-中央大腦架構：讀取 Data Lake -> PCA 降維 -> 派發預測至 13 個獨立檔案
+V14.0 PCA_TWII.py (全獨立檔案微服務 - 智慧尋名版)
+中央大腦：無需填寫 ID，直接依賴 Service Account 權限，透過「檔案名稱」自動尋找 Google Sheet。
+讀取 3 個來源檔 -> 寫入 1 個 PCA 檔 -> 派發至 13 個預測檔。
 """
 import os
 import json
@@ -15,34 +16,36 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ==========================================
-# 1. 主資料庫設定 (Data Lake 來源)
+# 1. 獨立輸入來源設定 (3個 Data Lake 檔案名稱)
 # ==========================================
-MAIN_DATABASE_ID = "1ZVmajxud7D4uRim8qKPRM4bA_TjnZOxvaZsWja3FKeM"
-SOURCE_SHEETS = [
-    "global_market_factors", 
-    "taifex_derivatives_history", 
-    "stock_history_AI_SCORE"
+SOURCE_FILE_NAMES = [
+    "stock_history_AI_SCORE",
+    "global_market_factors",
+    "taifex_derivatives_history"
 ]
-PCA_SHEET_NAME = "global_pca_features" 
 
 # ==========================================
-# 2. 13檔獨立檔案設定 (預測結果輸出地)
+# 2. 獨立 PCA 特徵輸出檔案名稱
 # ==========================================
-# ⚠️ 請替換成您真實的 13 個 Google Sheet ID，並記得把 Service Account Email 加入這 13 個檔案的「共用編輯者」中！
+PCA_OUTPUT_FILE_NAME = "global_pca_features"
+
+# ==========================================
+# 3. 獨立 13檔預測輸出檔案設定 (檔名對應預測目標欄位)
+# ==========================================
 TARGET_MAPPING = {
-    "PRE_台積電(2330)": {"col": "2330.TW_Close", "file_id": "請填寫_台積電_的GoogleSheet_ID"},
-    "PRE_聯電(2303)": {"col": "2303.TW_Close", "file_id": "請填寫_聯電_的GoogleSheet_ID"},
-    "PRE_英業達(2356)": {"col": "2356.TW_Close", "file_id": "請填寫_英業達_的GoogleSheet_ID"},
-    "PRE_中鋼(2002)": {"col": "2002.TW_Close", "file_id": "請填寫_中鋼_的GoogleSheet_ID"},
-    "PRE_NVIDIA(NVDA)": {"col": "NVDA_Close", "file_id": "請填寫_NVIDIA_的GoogleSheet_ID"},
-    "PRE_TESLA(TSLA)": {"col": "TSLA_Close", "file_id": "請填寫_TESLA_的GoogleSheet_ID"},
-    "PRE_INTEL(INTC)": {"col": "INTC_Close", "file_id": "請填寫_INTEL_的GoogleSheet_ID"},
-    "PRE_Apple(AAPL)": {"col": "AAPL_Close", "file_id": "請填寫_Apple_的GoogleSheet_ID"},
-    "PRE_Microsoft(MSFT)": {"col": "MSFT_Close", "file_id": "請填寫_Microsoft_的GoogleSheet_ID"},
-    "PRE_Amazon(AMZN)": {"col": "AMZN_Close", "file_id": "請填寫_Amazon_的GoogleSheet_ID"},
-    "PRE_Eli Lilly(LLY)": {"col": "LLY_Close", "file_id": "請填寫_Lilly_的GoogleSheet_ID"},
-    "PRE_Novo Nordisk(NVO)": {"col": "NVO_Close", "file_id": "請填寫_NovoNordisk_的GoogleSheet_ID"},
-    "PRE_Toyota(7203)": {"col": "7203.T_Close", "file_id": "請填寫_Toyota_的GoogleSheet_ID"}
+    "PRE_台積電(2330)": "2330.TW_Close",
+    "PRE_聯電(2303)": "2303.TW_Close",
+    "PRE_英業達(2356)": "2356.TW_Close",
+    "PRE_中鋼(2002)": "2002.TW_Close",
+    "PRE_NVIDIA(NVDA)": "NVDA_Close",
+    "PRE_TESLA(TSLA)": "TSLA_Close",
+    "PRE_INTEL(INTC)": "INTC_Close",
+    "PRE_Apple(AAPL)": "AAPL_Close",
+    "PRE_Microsoft(MSFT)": "MSFT_Close",
+    "PRE_Amazon(AMZN)": "AMZN_Close",
+    "PRE_Eli Lilly(LLY)": "LLY_Close",
+    "PRE_Novo Nordisk(NVO)": "NVO_Close",
+    "PRE_Toyota(7203)": "7203.T_Close"
 }
 
 WINDOWS = {"3day_Return(%)": 3, "7day_Return(%)": 7, "1month_Return(%)": 22, "1year_Return(%)": 252}
@@ -54,128 +57,130 @@ def get_gspread_client():
         raise ValueError("環境變數 GSPREAD_CREDENTIALS 未設定，請檢查您的金鑰！")
     return gspread.authorize(Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes))
 
-def safe_gspread_write_to_sheet(gc, spreadsheet_id, sheet_name, df, is_append=False):
+def safe_write_to_independent_file_by_name(gc, file_name, df, is_append=False):
+    """透過檔案名稱尋找並寫入資料 (永遠寫入 Sheet1)"""
     try:
-        spreadsheet = gc.open_by_key(spreadsheet_id)
-        try:
-            wks = spreadsheet.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            wks = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
+        # 直接使用檔名開啟，若有多個同名檔案會開啟第一個
+        spreadsheet = gc.open(file_name)
+        wks = spreadsheet.sheet1
         
         if is_append:
             existing = wks.get_all_values()
             if existing:
                 df_old = pd.DataFrame(existing[1:], columns=existing[0])
                 df = pd.concat([df_old, df], ignore_index=True)
-                df = df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
-        
-        wks.clear()
-        wks.update("A1", [df.columns.tolist()] + df.fillna("").values.tolist())
-    except gspread.exceptions.APIError as e:
-        print(f"  ❌ Google API 拒絕存取 ({sheet_name})！請檢查是否已將 Service Account Email 加入共用編輯者。錯誤詳情: {e}")
-    except Exception as e:
-        print(f"  ❌ 寫入主資料庫分頁 {sheet_name} 失敗，未知錯誤: {e}")
-
-def safe_gspread_write_to_independent_file(gc, file_id, df):
-    try:
-        spreadsheet = gc.open_by_key(file_id)
-        wks = spreadsheet.sheet1 
-        
-        existing = wks.get_all_values()
-        if existing:
-            df_old = pd.DataFrame(existing[1:], columns=existing[0])
-            df = pd.concat([df_old, df], ignore_index=True)
-            df = df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
+                if 'Date' in df.columns:
+                    df = df.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
             
         wks.clear()
         wks.update("A1", [df.columns.tolist()] + df.fillna("").values.tolist())
         return True
+        
+    except gspread.exceptions.SpreadsheetNotFound:
+        print(f"  ❌ 找不到檔案名稱為 [{file_name}] 的 Google Sheet，請確認您已建立該檔案且共用權限正確！")
+        return False
     except gspread.exceptions.APIError as e:
-        print(f"  ❌ 獨立檔案 (ID: {file_id}) API 拒絕存取！請確認該檔案有共用給機器人 Email。詳情: {e}")
+        print(f"  ❌ API 拒絕存取 [{file_name}]！權限不足或超出請求配額。")
         return False
     except Exception as e:
-        print(f"  ❌ 寫入獨立檔案 {file_id} 失敗: {e}")
+        print(f"  ❌ 寫入 [{file_name}] 失敗: {e}")
         return False
 
-def load_data_lake(gc, spreadsheet_id):
-    print("🌊 開始從主資料庫提取並構建 Data Lake...")
+def load_distributed_data_lake_by_name(gc, source_names):
+    """透過檔案名稱從多個獨立的 Google Sheet 提取資料並合併成 Data Lake"""
+    print("🌊 開始從雲端硬碟搜尋並提取 Data Lake...")
     merged_df = None
     
-    for sheet in SOURCE_SHEETS:
+    for name in source_names:
         try:
-            wks = gc.open_by_key(spreadsheet_id).worksheet(sheet)
+            spreadsheet = gc.open(name)
+            wks = spreadsheet.sheet1
             data = wks.get_all_values()
-            if len(data) < 2: continue
+            
+            if len(data) < 2: 
+                print(f"  ⚠️ 來源 [{name}] 內沒有足夠的資料列，跳過。")
+                continue
             
             df = pd.DataFrame(data[1:], columns=data[0])
-            if 'Date' not in df.columns: continue
+            if 'Date' not in df.columns: 
+                print(f"  ⚠️ 來源 [{name}] 找不到 'Date' 欄位，跳過。")
+                continue
             
-            df['Date'] = pd.to_datetime(df['Date'])
+            # --- 日期髒資料清洗防禦機制 ---
+            df['Date'] = df['Date'].astype(str).str.strip()
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce') 
+            df = df.dropna(subset=['Date']) 
+            
+            if df.empty:
+                print(f"  ⚠️ 來源 [{name}] 內沒有合法的日期資料，跳過。")
+                continue
+
             for col in df.columns:
                 if col != 'Date':
                     df[col] = pd.to_numeric(df[col].replace("", np.nan), errors='coerce')
                     
-            if merged_df is None: merged_df = df
-            else: merged_df = pd.merge(merged_df, df, on="Date", how="outer")
-            print(f"  ✅ 成功載入來源: {sheet}")
+            if merged_df is None: 
+                merged_df = df
+            else: 
+                merged_df = pd.merge(merged_df, df, on="Date", how="outer")
+                
+            print(f"  ✅ 成功載入來源: [{name}] (有效筆數: {len(df)})")
             
-        except gspread.exceptions.APIError as e:
-            print(f"  ❌ 讀取 {sheet} 權限遭拒！請確認主資料庫是否已共用。")
-        except gspread.exceptions.WorksheetNotFound:
-            print(f"  ⚠️ 找不到分頁 {sheet}，請確認爬蟲是否已成功建立該分頁。")
+        except gspread.exceptions.SpreadsheetNotFound:
+            print(f"  ❌ 找不到檔案 [{name}]，請確認檔名完全一致且已共用。")
         except Exception as e:
-            print(f"  ❌ 載入來源 {sheet} 發生異常: {e}")
+            print(f"  ❌ 載入來源 [{name}] 發生異常: {e}")
             
-    if merged_df is not None:
+    if merged_df is not None and not merged_df.empty:
         merged_df = merged_df.sort_values("Date").ffill().bfill().fillna(0)
+        
     return merged_df
 
 def main():
     print("="*60)
-    print("🧠 啟動分散式 PCA 降維與多維非線性預測大腦")
+    print("🧠 啟動全獨立檔案微服務架構 (智慧尋檔版)")
     print("="*60)
     
     try:
         gc = get_gspread_client()
         
         # 1. 取得與合併資料湖
-        df_lake = load_data_lake(gc, MAIN_DATABASE_ID)
+        df_lake = load_distributed_data_lake_by_name(gc, SOURCE_FILE_NAMES)
+        
         if df_lake is None or df_lake.empty:
-            print("❌ Data Lake 為空，終止執行。請先確認前三支爬蟲有成功執行並寫入資料！")
+            print("❌ Data Lake 組合失敗或為空，終止執行。請確認來源檔案皆存在且有資料。")
             return
             
-        # 2. PCA 降維提取
+        # 2. PCA 降維提取 (寫入獨立 PCA 檔案)
         print("\n🧬 執行 PCA 降維特徵萃取...")
         X_raw = df_lake.drop(columns=['Date'])
-        pca = PCA(n_components=5)
+        # 確保有足夠的特徵欄位做PCA，避免欄位不足5個報錯
+        n_components = min(5, X_raw.shape[1]) 
+        pca = PCA(n_components=n_components)
         X_pca = pca.fit_transform(StandardScaler().fit_transform(X_raw))
         
-        df_pca = pd.DataFrame(X_pca, columns=[f"PC{i+1}" for i in range(5)])
+        df_pca = pd.DataFrame(X_pca, columns=[f"PC{i+1}" for i in range(n_components)])
         df_pca.insert(0, 'Date', df_lake['Date'].dt.strftime('%Y-%m-%d'))
         
-        safe_gspread_write_to_sheet(gc, MAIN_DATABASE_ID, PCA_SHEET_NAME, df_pca)
-        print(f"  ✅ PCA 特徵已更新至主資料庫的 {PCA_SHEET_NAME} 分頁")
-        
+        # 覆寫模式寫入 PCA 獨立檔案
+        success_pca = safe_write_to_independent_file_by_name(gc, PCA_OUTPUT_FILE_NAME, df_pca, is_append=False)
+        if success_pca:
+            print(f"  ✅ PCA 特徵已成功更新至 [{PCA_OUTPUT_FILE_NAME}]")
+            
         # 3. 預測並派發到 13 個獨立檔案
         today_str = datetime.now().strftime("%Y-%m-%d")
-        print(f"\n🎯 啟動 Polynomial + Ridge 預測，並派發至獨立檔案...")
+        print(f"\n🎯 啟動 Polynomial + Ridge 預測，自動尋找 13 個目標檔案派發...")
         
         poly = PolynomialFeatures(degree=2, include_bias=False)
         
-        for target_name, config in TARGET_MAPPING.items():
-            target_col = config["col"]
-            file_id = config["file_id"]
-            
-            if "請填寫" in file_id:
-                print(f"  ⚠️ 尚未填寫 [{target_name}] 的檔案 ID，跳過...")
-                continue
-                
+        for file_name, target_col in TARGET_MAPPING.items():
             if target_col not in df_lake.columns:
-                print(f"  ⚠️ 資料庫缺漏欄位 [{target_col}]，跳過 [{target_name}]...")
+                print(f"  ⚠️ Data Lake 中缺少目標股價欄位 [{target_col}]，跳過派發至 [{file_name}]...")
                 continue
                 
             pred_record = {"Date": today_str}
             
+            # 計算四個週期的回報率並訓練模型
             for w_name, w_days in WINDOWS.items():
                 y = df_lake[target_col].pct_change(w_days).shift(-w_days) * 100
                 valid_idx = y.notna()
@@ -192,12 +197,13 @@ def main():
                 X_latest_poly = poly.transform([X_pca[-1]])
                 pred_record[w_name] = round(model.predict(X_latest_poly)[0], 4)
                 
+            # 附加模式 (Append) 寫入獨立檔案
             df_pred = pd.DataFrame([pred_record])
-            success = safe_gspread_write_to_independent_file(gc, file_id, df_pred)
+            success = safe_write_to_independent_file_by_name(gc, file_name, df_pred, is_append=True)
             if success:
-                print(f"  ✅ [{target_name}] 成功派發預測至獨立檔案！")
+                print(f"  ✅ 成功派發預測至 [{file_name}]！")
             
-        print("\n🎉 大腦預測與派發任務執行完畢！")
+        print("\n🎉 全部分散式派發任務執行完畢！")
 
     except Exception as e:
         print(f"\n💥 執行期間發生重大錯誤: {e}")
