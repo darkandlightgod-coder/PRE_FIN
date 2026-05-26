@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-V11.4 PCA_TWII.py (多檔案獨立寫入版)
-將 13 檔標的預測結果，分別寫入 13 個獨立的 Google Sheet 檔案中。
+V11.5 PCA_TWII.py (含大盤預測版)
+新增台灣加權指數 (PRE_TWII) 預測，並維持 14 個獨立檔案寫入架構。
 """
 import os
 import sys
@@ -12,14 +12,10 @@ from datetime import datetime
 # ==========================================
 # 【設定區：資料湖與獨立檔案網址】
 # ==========================================
-# 1. 您的 Data Lake (包含 global_market_factors) 網址
-# (若留空 ""，程式會自動掃描尋找)
 DATA_LAKE_URL = "" 
 
-# 2. 13 個獨立檔案的對應設定
-# 您可以將每一個獨立 Google Sheet 的網址填入後方的引號中。
-# 如果留空 ""，程式會自動在服務帳戶中尋找「檔名一模一樣」的檔案。
 TARGET_SPREADSHEETS = {
+    "PRE_TWII": "",         # 🆕 新增：台灣加權指數大盤
     "PRE_台積電(2330)": "",
     "PRE_聯電(2303)": "",
     "PRE_英業達(2356)": "",
@@ -148,25 +144,23 @@ def load_data_lake(sh):
     return df
 
 def find_independent_spreadsheet(gc, file_name, file_url):
-    """根據網址或檔名，尋找獨立的 Google Sheet 檔案"""
     if file_url.strip():
         try:
             return gc.open_by_url(file_url.strip())
         except Exception:
             return None
             
-    # 網址為空時，搜尋服務帳戶內的檔案名稱
     files = gc.list_spreadsheet_files()
     for f in files:
         if f.get('name') == file_name:
             return gc.open_by_key(f['id'])
-            
     return None
 
 # ==========================================
 # 股票代碼與預測核心
 # ==========================================
 def extract_ticker(file_name):
+    if file_name == "PRE_TWII": return "^TWII"  # 🆕 台灣加權指數的 Yahoo Finance 代碼
     match = re.search(r'\((.*?)\)', file_name)
     if not match: return None
     t = match.group(1)
@@ -193,6 +187,7 @@ def predict_stock_returns(X_pca_df, ticker):
     
     predictions = {}
     for window_name, shift_days in WINDOWS.items():
+        # 預測目標：未來 N 天的「報酬率」 (百分比)
         y_target = aligned_data["Close"].pct_change(shift_days).shift(-shift_days) * 100
         valid_idx = ~y_target.isna()
         X_train = X_aligned[valid_idx]
@@ -221,7 +216,7 @@ def predict_stock_returns(X_pca_df, ticker):
 # ==========================================
 def main():
     print("="*60)
-    print("🧠 PCA 預測大腦 (多檔案獨立寫入版)")
+    print("🧠 PCA 預測大腦 (含大盤預測版)")
     print("="*60)
     
     try:
@@ -268,19 +263,15 @@ def main():
         for file_name, file_url in TARGET_SPREADSHEETS.items():
             print(f"\n👉 處理標的: {file_name}")
             
-            # 1. 尋找獨立檔案
             target_sh = find_independent_spreadsheet(gc, file_name, file_url)
             if not target_sh:
                 print(f"   ❌ 找不到名為 '{file_name}' 的獨立試算表。")
-                print(f"   💡 解法: 請確認有建立此檔案並共用給服務帳戶，或直接將網址填入程式碼的 TARGET_SPREADSHEETS 中！")
                 continue
                 
-            # 2. 執行預測
             ticker = extract_ticker(file_name)
             if not ticker: continue
             preds = predict_stock_returns(df_pca, ticker)
             
-            # 3. 寫入該獨立檔案內的 "預測紀錄" 分頁
             if preds:
                 row_data = pd.DataFrame([{
                     "Date": today_str,
@@ -292,7 +283,6 @@ def main():
                     "Update_Time": datetime.now().strftime("%H:%M:%S")
                 }])
                 
-                # 寫入名為 "預測紀錄" 的分頁 (如果沒有會自動建立)
                 if safe_gspread_write(gc, target_sh.id, "預測紀錄", row_data, mode="append"):
                     print(f"   ✅ 成功寫入獨立檔案 -> {target_sh.title} (分頁: 預測紀錄)")
                     print(f"   📊 預測結果: 3天[{preds.get('3day')}%], 1月[{preds.get('1month')}%]")
