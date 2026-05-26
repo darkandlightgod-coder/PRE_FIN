@@ -1,29 +1,60 @@
 # -*- coding: utf-8 -*-
 """
-V11.0 PCA_TWII.py (跨國全自動對齊版)
+V11.1 PCA_TWII.py (跨國全自動對齊 + 環境自癒版)
 整合 13 檔個股預測與非線性多項式展開 (PolynomialFeatures)
 內建 .ffill() 處理跨國休市空值，並自動解析 Ticker 抓取真實目標 (Y)。
+拔除多餘繪圖套件，加入自動補齊依賴套件功能。
 """
 import os
 import sys
+import subprocess
+import importlib
+from datetime import datetime
+
+# ==========================================
+# 【0. 環境自癒與延遲載入 (Bootstrap)】
+# ==========================================
+def bootstrap():
+    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 PCA_TWII 環境檢查與修復...")
+    dependencies = {
+        "pandas": "pandas",
+        "numpy": "numpy",
+        "sklearn": "scikit-learn",
+        "gspread": "gspread",
+        "google.oauth2.service_account": "google-auth",
+        "yfinance": "yfinance"
+    }
+
+    installed_any = False
+    for module, package in dependencies.items():
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            print(f"📦 偵測到雲端環境缺失套件，正在自動安裝: {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            installed_any = True
+
+    if installed_any:
+        importlib.invalidate_caches()
+        print("✅ 缺失套件自動補齊完成！\n")
+
+# 執行環境自癒
+bootstrap()
+
+# --- 確保套件安裝後再正式 import ---
 import json
 import time
 import traceback
 import re
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
+from datetime import timedelta
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.linear_model import Ridge
 import gspread
 from google.oauth2.service_account import Credentials
 import yfinance as yf
-
-# 設定字體，避免圖表中文亂碼
-plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'Arial', 'sans-serif']
-plt.rcParams['axes.unicode_minus'] = False
 
 # 目標預測清單
 TARGET_SHEETS = [
@@ -147,11 +178,10 @@ def predict_stock_returns(X_pca_df, ticker):
     
     # 2. 針對不同時間窗格進行預測
     for window_name, shift_days in WINDOWS.items():
-        # 計算未來 N 天的報酬率作為 Y (例如：把 3 天後的報酬率，放在今天的列)
-        # pct_change(N).shift(-N) 確保我們是用 "今天的特徵" 預測 "未來的回報"
+        # 計算未來 N 天的報酬率作為 Y
         y_target = aligned_data["Close"].pct_change(shift_days).shift(-shift_days) * 100
         
-        # 移除最後 N 天 (因為它們沒有未來 N 天的答案，無法當作訓練資料)
+        # 移除最後 N 天
         valid_idx = ~y_target.isna()
         X_train = X_aligned[valid_idx]
         Y_train = y_target[valid_idx].values
@@ -160,11 +190,11 @@ def predict_stock_returns(X_pca_df, ticker):
             predictions[window_name] = "N/A"
             continue
             
-        # 多項式特徵展開 (捕捉非線性關聯，例如: 股市過熱時反而會跌)
+        # 多項式特徵展開
         poly = PolynomialFeatures(degree=2, include_bias=False)
         X_train_poly = poly.fit_transform(X_train)
         
-        # 建立 Ridge 迴歸模型並訓練 (L2正則化防止過度擬合)
+        # 建立 Ridge 迴歸模型並訓練
         model = Ridge(alpha=1.0)
         model.fit(X_train_poly, Y_train)
         
@@ -188,7 +218,6 @@ def main():
     
     try:
         gc = get_gspread_client()
-        # 假設你的資料都在第一個試算表中，若有多個請用 open("你的試算表名稱")
         sp_id = gc.list_spreadsheet_files()[0]['id'] 
         
         print("\n步驟 1: 載入並清理資料湖 (Data Lake)...")
@@ -203,11 +232,9 @@ def main():
         feats = pca.fit_transform(X_scaled)
         
         df_pca = pd.DataFrame(feats, index=df_lake.index, columns=[f"PC{i+1}" for i in range(5)])
-        # 記錄主成分解釋的變異比例
         variance_ratio = pca.explained_variance_ratio_
         print(f"前五大主成分累積解釋力: {sum(variance_ratio)*100:.2f}%")
         
-        # 將 PCA 特徵寫回 Google Sheets
         df_pca_output = df_pca.reset_index()
         df_pca_output['Date'] = df_pca_output['Date'].dt.strftime('%Y-%m-%d')
         safe_gspread_write(gc, sp_id, "global_pca_features", df_pca_output, mode="clear_update")
@@ -223,11 +250,9 @@ def main():
                 print(f"   ⚠️ 無法解析 Ticker，跳過。")
                 continue
                 
-            # 進行預測
             preds = predict_stock_returns(df_pca, ticker)
             
             if preds:
-                # 準備寫入格式
                 row_data = pd.DataFrame([{
                     "Date": today_str,
                     "3_Days_Pred(%)": preds.get("3day", "N/A"),
@@ -238,7 +263,6 @@ def main():
                     "Update_Time": datetime.now().strftime("%H:%M:%S")
                 }])
                 
-                # 追加到該股票專屬的預測表中 (Append mode)
                 safe_gspread_write(gc, sp_id, sheet_name, row_data, mode="append")
                 print(f"   📊 預測結果: 3天[{preds.get('3day')}%], 7天[{preds.get('7day')}%], 1月[{preds.get('1month')}%]")
             else:
