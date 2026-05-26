@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-V13.0 PCA_TWII.py (多模型競技場 - 5層獨立評估版)
-將評估維度拆分為 3天、7天、1個月、1年、以及 Overall(整體) 共 5 層。
-每個模型在不同時間維度會有獨立的 RMSE 誤差與排名，讓優劣勢無所遁形。
+V13.1 PCA_TWII.py (多模型競技場 - 5層獨立評估 + 無爬蟲純淨版)
+完全移除 yfinance 依賴，直接從 Data Lake (rawdata) 中動態抓取對應的目標欄位。
+提升穩定度、執行速度，並確保特徵與目標數值日期完美對齊。
 """
 import os
 import sys
@@ -33,7 +33,7 @@ TARGET_SPREADSHEETS = {
 }
 
 # ==========================================
-# 【環境自癒與延遲載入】
+# 【環境自癒與延遲載入】(移除了 yfinance)
 # ==========================================
 def bootstrap():
     print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動環境檢查 (包含進階機器學習套件)...")
@@ -43,8 +43,7 @@ def bootstrap():
         "sklearn": "scikit-learn",
         "xgboost": "xgboost",           
         "gspread": "gspread",
-        "google.oauth2.service_account": "google-auth",
-        "yfinance": "yfinance"
+        "google.oauth2.service_account": "google-auth"
     }
 
     installed_any = False
@@ -79,7 +78,6 @@ from xgboost import XGBRegressor
 
 import gspread
 from google.oauth2.service_account import Credentials
-import yfinance as yf
 
 WINDOWS = {"3day": 3, "7day": 7, "1month": 22, "1year": 252}
 
@@ -156,6 +154,9 @@ def load_data_lake(sh):
     df = df.ffill().bfill() 
     df.dropna(axis=1, how='all', inplace=True)
     
+    # 按照時間由舊到新排序，確保 shift 時序正確
+    df.sort_index(inplace=True)
+    
     if df.empty: raise ValueError("資料清洗後變成完全空值！")
     return df
 
@@ -170,19 +171,33 @@ def find_independent_spreadsheet(gc, file_name, file_url):
             return gc.open_by_key(f['id'])
     return None
 
-def extract_ticker(file_name):
-    if file_name == "PRE_TWII": return "^TWII"
-    match = re.search(r'\((.*?)\)', file_name)
-    if not match: return None
-    t = match.group(1)
-    if t.isdigit() and len(t) == 4: return f"{t}.TW"
-    if t == "7203": return "7203.T"
-    return t
+def identify_target_column(df, file_name):
+    """
+    從 Data Lake 的欄位中，智慧尋找對應的目標欄位 (例如: 從 'PRE_台積電(2330)' 找出包含 '2330' 或 '台積電' 的欄位)
+    """
+    candidates = []
+    if "TWII" in file_name:
+        candidates = ["^TWII", "TWII", "加權指數", "大盤"]
+    else:
+        # 提取括號內的代碼，如 2330, NVDA
+        match = re.search(r'\((.*?)\)', file_name)
+        if match:
+            candidates.append(match.group(1))
+        # 提取去掉 PRE_ 的名稱，如 台積電
+        candidates.append(file_name.replace("PRE_", ""))
+        
+    for col in df.columns:
+        for cand in candidates:
+            # 不分大小寫比對，只要特徵欄位名稱包含該代碼/名稱即視為命中
+            if cand.lower() in str(col).lower():
+                return col
+    return None
 
 # ==========================================
 # 🚀 核心：5層矩陣競技與評估 (Layered Model Arena)
 # ==========================================
-def predict_with_layered_arena(df_lake, ticker):
+def predict_with_layered_arena(df_lake, target_col):
+    # 1. 建立特徵 (Features)
     scaler = StandardScaler()
     X_scaled_np = scaler.fit_transform(df_lake)
     df_X_scaled = pd.DataFrame(X_scaled_np, index=df_lake.index, columns=df_lake.columns)
@@ -191,15 +206,8 @@ def predict_with_layered_arena(df_lake, ticker):
     X_pca_np = pca.fit_transform(X_scaled_np)
     df_X_pca = pd.DataFrame(X_pca_np, index=df_lake.index, columns=[f"PC{i+1}" for i in range(5)])
     
-    start_date = df_lake.index.min().strftime('%Y-%m-%d')
-    end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-    stock_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-    
-    if stock_data.empty: return None
-    
-    y_raw = stock_data['Close']
-    if isinstance(y_raw, pd.DataFrame): y_raw = y_raw.iloc[:, 0]
-    y_raw.index = pd.to_datetime(y_raw.index)
+    # 2. 直接從 Data Lake 取出目標欄位當作 y_raw (無須透過 yfinance)
+    y_raw = df_lake[target_col]
     
     aligned_data = pd.concat([df_X_scaled, df_X_pca, y_raw.rename("Close")], axis=1).dropna()
     if aligned_data.empty: return None
@@ -211,6 +219,7 @@ def predict_with_layered_arena(df_lake, ticker):
     model_rmse = {m: {} for m in model_names} 
     
     for window_name, shift_days in WINDOWS.items():
+        # 計算未來 N 天的漲跌幅 (%) 作為預測目標
         y_target = aligned_data["Close"].pct_change(shift_days).shift(-shift_days) * 100
         valid_idx = ~y_target.isna()
         
@@ -226,6 +235,7 @@ def predict_with_layered_arena(df_lake, ticker):
         
         split_idx = int(len(Y_v) * 0.8)
         
+        # 準備最後一筆資料做為「明日起算」的預測基準
         X_latest_raw = aligned_data[df_lake.columns].values[-1].reshape(1, -1)
         X_latest_pca = aligned_data[[f"PC{i+1}" for i in range(5)]].values[-1].reshape(1, -1)
         
@@ -298,14 +308,14 @@ def predict_with_layered_arena(df_lake, ticker):
 # ==========================================
 def main():
     print("="*60)
-    print("🏆 PCA x 機器學習 (5 層矩陣獨立評估版)")
+    print("🏆 PCA x 機器學習 (5 層矩陣獨立評估 + 無爬蟲純淨版)")
     print("="*60)
     
     try:
         gc = get_gspread_client()
         lake_sh = None
         
-        print("\n步驟 1: 載入 Data Lake...")
+        print("\n步驟 1: 載入 Data Lake (rawdata)...")
         if DATA_LAKE_URL.strip():
             lake_sh = gc.open_by_url(DATA_LAKE_URL.strip())
         else:
@@ -321,7 +331,7 @@ def main():
         if not lake_sh: raise ValueError("找不到 Data Lake！")
             
         df_lake = load_data_lake(lake_sh)
-        print(f"   ✅ 成功載入特徵，資料筆數: {len(df_lake)}")
+        print(f"   ✅ 成功載入特徵與歷史股價，資料筆數: {len(df_lake)}")
         
         print(f"\n🎯 步驟 2: 啟動多模型分層預測與跨檔案寫入...")
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -333,15 +343,20 @@ def main():
             
             target_sh = find_independent_spreadsheet(gc, file_name, file_url)
             if not target_sh:
-                print(f"   ❌ 找不到檔案。")
+                print(f"   ❌ 找不到目標獨立試算表。")
                 continue
                 
-            ticker = extract_ticker(file_name)
-            if not ticker: continue
+            # 🔍 從 Data Lake 找出這檔股票對應的欄位名稱
+            target_col = identify_target_column(df_lake, file_name)
+            if not target_col: 
+                print(f"   ⚠️ 在 Data Lake 中找不到與 '{file_name}' 匹配的欄位，跳過！")
+                continue
+                
+            print(f"   🔍 鎖定 Data Lake 目標欄位: [{target_col}]")
             
-            result = predict_with_layered_arena(df_lake, ticker)
+            result = predict_with_layered_arena(df_lake, target_col)
             if not result:
-                print(f"   ⚠️ 資料不足，跳過。")
+                print(f"   ⚠️ 資料計算後不足，跳過。")
                 continue
                 
             layered_results, df_pca_features = result
@@ -392,8 +407,8 @@ def main():
                 print(f"   ✅ 成功寫入 5 層評估報告: {target_sh.title}")
                 best_3d = sorted(layered_results.keys(), key=lambda m: layered_results[m]['Ranks'].get('3day', 99))[0]
                 best_1y = sorted(layered_results.keys(), key=lambda m: layered_results[m]['Ranks'].get('1year', 99))[0]
-                print(f"   🏆 3天短線最準模型: {best_3d} (RMSE: {round(layered_results[best_3d]['RMSE'].get('3day',0),2)})")
-                print(f"   🏆 1年長線最準模型: {best_1y} (RMSE: {round(layered_results[best_1y]['RMSE'].get('1year',0),2)})")
+                print(f"   🏆 3天短線最準: {best_3d} (RMSE: {round(layered_results[best_3d]['RMSE'].get('3day',0),2)})")
+                print(f"   🏆 1年長線最準: {best_1y} (RMSE: {round(layered_results[best_1y]['RMSE'].get('1year',0),2)})")
 
         if first_run_pca is not None:
             df_pca_output = first_run_pca.reset_index()
