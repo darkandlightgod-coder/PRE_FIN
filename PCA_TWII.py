@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-V11.1 PCA_TWII.py (跨國全自動對齊 + 環境自癒版)
-整合 13 檔個股預測與非線性多項式展開 (PolynomialFeatures)
-內建 .ffill() 處理跨國休市空值，並自動解析 Ticker 抓取真實目標 (Y)。
-拔除多餘繪圖套件，加入自動補齊依賴套件功能。
+V11.2 PCA_TWII.py (增強除錯與防呆版)
+加強 Google Sheets 讀取防呆機制、Date 欄位自動偵測
 """
 import os
 import sys
@@ -12,10 +10,10 @@ import importlib
 from datetime import datetime
 
 # ==========================================
-# 【0. 環境自癒與延遲載入 (Bootstrap)】
+# 【0. 環境自癒與延遲載入】
 # ==========================================
 def bootstrap():
-    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動 PCA_TWII 環境檢查與修復...")
+    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動環境檢查...")
     dependencies = {
         "pandas": "pandas",
         "numpy": "numpy",
@@ -30,18 +28,16 @@ def bootstrap():
         try:
             importlib.import_module(module)
         except ImportError:
-            print(f"📦 偵測到雲端環境缺失套件，正在自動安裝: {package}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            print(f"📦 自動安裝: {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
             installed_any = True
 
     if installed_any:
         importlib.invalidate_caches()
-        print("✅ 缺失套件自動補齊完成！\n")
+        print("✅ 套件自動補齊完成！\n")
 
-# 執行環境自癒
 bootstrap()
 
-# --- 確保套件安裝後再正式 import ---
 import json
 import time
 import traceback
@@ -56,7 +52,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 import yfinance as yf
 
-# 目標預測清單
 TARGET_SHEETS = [
     "PRE_台積電(2330)", "PRE_聯電(2303)", "PRE_英業達(2356)", "PRE_中鋼(2002)",
     "PRE_NVIDIA(NVDA)", "PRE_TESLA(TSLA)", "PRE_INTEL(INTC)", "PRE_Apple(AAPL)",
@@ -64,11 +59,10 @@ TARGET_SHEETS = [
     "PRE_Toyota(7203)"
 ]
 
-# 預測時間窗格 (交易日)
 WINDOWS = {"3day": 3, "7day": 7, "1month": 22, "1year": 252}
 
 # ==========================================
-# Google Sheets 連線與工具函數
+# Google Sheets 工具函數
 # ==========================================
 def get_gspread_client():
     creds_json = os.environ.get("GSPREAD_CREDENTIALS")
@@ -77,12 +71,10 @@ def get_gspread_client():
         creds_dict = json.loads(creds_json)
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     else:
-        # 本地端測試：請確保 credentials.json 存在
         creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
     return gspread.authorize(creds)
 
 def safe_gspread_write(gc, sp_id, sheet_name, df, mode="clear_update"):
-    """安全寫入 Google Sheets，具備重試機制以避免 API 限制"""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -92,7 +84,6 @@ def safe_gspread_write(gc, sp_id, sheet_name, df, mode="clear_update"):
             except gspread.exceptions.WorksheetNotFound:
                 worksheet = sh.add_worksheet(title=sheet_name, rows=str(len(df)+50), cols=str(len(df.columns)+5))
             
-            # 將 DataFrame 轉為可寫入的二維陣列 (處理 NaN)
             df = df.fillna("")
             data = [df.columns.values.tolist()] + df.values.tolist()
             
@@ -102,103 +93,101 @@ def safe_gspread_write(gc, sp_id, sheet_name, df, mode="clear_update"):
             elif mode == "append":
                 worksheet.append_rows(df.values.tolist())
                 
-            print(f"✅ 成功寫入工作表: {sheet_name} (Mode: {mode})")
+            print(f"   ✅ 成功寫入: {sheet_name}")
             return True
         except Exception as e:
-            print(f"⚠️ 寫入 {sheet_name} 失敗 (嘗試 {attempt+1}/{max_retries}): {e}")
-            time.sleep(3)
+            print(f"   ⚠️ 寫入失敗 (嘗試 {attempt+1}): {e}")
+            time.sleep(2)
     return False
 
 def load_data_lake(gc, sp_id):
-    """讀取 global_market_factors 作為特徵池 (X)"""
+    """讀取並強化清理資料湖 (具備防呆機制)"""
     sh = gc.open_by_key(sp_id)
-    ws = sh.worksheet("global_market_factors")
+    print(f"   📄 成功連線試算表: {sh.title}")
+    
+    try:
+        ws = sh.worksheet("global_market_factors")
+    except gspread.exceptions.WorksheetNotFound:
+        raise ValueError(f"找不到分頁 'global_market_factors'！請確認爬蟲是否有寫入此檔案 ({sh.title})。")
+        
     data = ws.get_all_values()
+    if not data or len(data) < 2:
+        raise ValueError("分頁 'global_market_factors' 沒有資料或只有標題！無法進行 PCA 分析。")
+        
     df = pd.DataFrame(data[1:], columns=data[0])
-    df['Date'] = pd.to_datetime(df['Date'])
+    
+    # 防呆：如果找不到 Date，試著找找看有沒有中文的「日期」，或者強制拿第一欄
+    if 'Date' not in df.columns:
+        if '日期' in df.columns:
+            df.rename(columns={'日期': 'Date'}, inplace=True)
+            print("   ⚠️ 發現欄位名稱為 '日期'，已自動轉換為 'Date'")
+        else:
+            first_col = df.columns[0]
+            df.rename(columns={first_col: 'Date'}, inplace=True)
+            print(f"   ⚠️ 找不到 Date 欄位，強制將第一欄 '{first_col}' 視為 Date")
+    
+    try:
+        df['Date'] = pd.to_datetime(df['Date'])
+    except Exception as e:
+        raise ValueError(f"日期格式轉換失敗！請檢查 Date 欄位裡是不是有奇怪的文字。詳細錯誤: {e}")
+        
     df.set_index('Date', inplace=True)
-    
-    # 將所有資料轉為數值，無法轉換的變成 NaN
     df = df.apply(pd.to_numeric, errors='coerce')
+    df = df.ffill().bfill() # 填補各國休市空值
     
-    # 🌟 核心：使用 forward fill 填補跨國休市產生的空洞！
-    df = df.ffill().bfill()
+    # 刪除完全是空值的欄位
+    df.dropna(axis=1, how='all', inplace=True)
+    
+    if df.empty:
+        raise ValueError("資料清洗後變成完全空值！請檢查表內資料是否都是非數字的字串。")
+        
     return df
 
 # ==========================================
-# 股票代碼解析與獲取函數
+# 股票代碼與預測核心
 # ==========================================
 def extract_ticker(sheet_name):
-    """從工作表名稱萃取 Yahoo Finance 的 Ticker"""
     match = re.search(r'\((.*?)\)', sheet_name)
-    if not match:
-        return None
-    
-    ticker_core = match.group(1)
-    
-    if ticker_core.isdigit():
-        if len(ticker_core) == 4:
-            return f"{ticker_core}.TW" # 台股
-        elif ticker_core == "7203":
-            return "7203.T" # 豐田 (日股)
-    
-    return ticker_core # 美股 (NVDA, TSLA 等)
+    if not match: return None
+    t = match.group(1)
+    if t.isdigit() and len(t) == 4: return f"{t}.TW"
+    if t == "7203": return "7203.T"
+    return t
 
-# ==========================================
-# 機器學習訓練與預測核心
-# ==========================================
 def predict_stock_returns(X_pca_df, ticker):
-    """為單一股票訓練模型並產生預測"""
-    # 1. 抓取該股票歷史真實價格作為目標 (Y)
-    print(f"   📥 正在抓取 {ticker} 歷史價格作為訓練目標...")
     start_date = X_pca_df.index.min().strftime('%Y-%m-%d')
     end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
     stock_data = yf.download(ticker, start=start_date, end=end_date, progress=False)
     
-    if stock_data.empty:
-        print(f"   ❌ 找不到 {ticker} 的歷史資料。")
-        return None
+    if stock_data.empty: return None
     
-    # 整理 Y 並與 X 對齊日期
     y_raw = stock_data['Close']
-    if isinstance(y_raw, pd.DataFrame):
-        y_raw = y_raw.iloc[:, 0] # 處理 MultiIndex 狀況
+    if isinstance(y_raw, pd.DataFrame): y_raw = y_raw.iloc[:, 0]
         
     y_raw.index = pd.to_datetime(y_raw.index)
-    # 將 X (PCA特徵) 與 Y (股價) 用 index (日期) 對齊，捨棄兩邊配不上的日子
     aligned_data = pd.concat([X_pca_df, y_raw.rename("Close")], axis=1).dropna()
     
-    if aligned_data.empty:
-        return None
+    if aligned_data.empty: return None
 
     X_aligned = aligned_data.drop(columns=["Close"]).values
-    prices = aligned_data["Close"].values
     
     predictions = {}
-    
-    # 2. 針對不同時間窗格進行預測
     for window_name, shift_days in WINDOWS.items():
-        # 計算未來 N 天的報酬率作為 Y
         y_target = aligned_data["Close"].pct_change(shift_days).shift(-shift_days) * 100
-        
-        # 移除最後 N 天
         valid_idx = ~y_target.isna()
         X_train = X_aligned[valid_idx]
         Y_train = y_target[valid_idx].values
         
-        if len(X_train) < 50: # 資料太少不具代表性
+        if len(X_train) < 30: 
             predictions[window_name] = "N/A"
             continue
             
-        # 多項式特徵展開
         poly = PolynomialFeatures(degree=2, include_bias=False)
         X_train_poly = poly.fit_transform(X_train)
         
-        # 建立 Ridge 迴歸模型並訓練
         model = Ridge(alpha=1.0)
         model.fit(X_train_poly, Y_train)
         
-        # 使用「最後一天的最新特徵」預測未來
         X_latest = X_aligned[-1].reshape(1, -1)
         X_latest_poly = poly.transform(X_latest)
         pred_value = model.predict(X_latest_poly)[0]
@@ -212,17 +201,20 @@ def predict_stock_returns(X_pca_df, ticker):
 # ==========================================
 def main():
     print("="*60)
-    print("🧠 PCA 降維與 Ridge 多維預測大腦 (13檔跨國對齊版)")
-    print(f"啟動時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("🧠 PCA 預測大腦 (防呆診斷版)")
     print("="*60)
     
     try:
         gc = get_gspread_client()
-        sp_id = gc.list_spreadsheet_files()[0]['id'] 
+        files = gc.list_spreadsheet_files()
+        if not files:
+            raise ValueError("您的服務帳戶沒有存取任何試算表的權限！請確認您有將試算表共用給服務帳戶的 Email。")
+            
+        sp_id = files[0]['id'] 
         
         print("\n步驟 1: 載入並清理資料湖 (Data Lake)...")
         df_lake = load_data_lake(gc, sp_id)
-        print(f"成功載入特徵，資料筆數: {len(df_lake)}")
+        print(f"   ✅ 成功載入特徵，資料筆數: {len(df_lake)}")
         
         print("\n步驟 2: 執行全局 PCA 降維萃取大盤核心情緒...")
         scaler = StandardScaler()
@@ -232,23 +224,17 @@ def main():
         feats = pca.fit_transform(X_scaled)
         
         df_pca = pd.DataFrame(feats, index=df_lake.index, columns=[f"PC{i+1}" for i in range(5)])
-        variance_ratio = pca.explained_variance_ratio_
-        print(f"前五大主成分累積解釋力: {sum(variance_ratio)*100:.2f}%")
-        
         df_pca_output = df_pca.reset_index()
         df_pca_output['Date'] = df_pca_output['Date'].dt.strftime('%Y-%m-%d')
         safe_gspread_write(gc, sp_id, "global_pca_features", df_pca_output, mode="clear_update")
 
-        print(f"\n🎯 步驟 3: 啟動 13 檔權值股 Polynomial 預測程序...")
+        print(f"\n🎯 步驟 3: 啟動預測程序...")
         today_str = datetime.now().strftime("%Y-%m-%d")
         
         for sheet_name in TARGET_SHEETS:
             print(f"\n👉 處理標的: {sheet_name}")
             ticker = extract_ticker(sheet_name)
-            
-            if not ticker:
-                print(f"   ⚠️ 無法解析 Ticker，跳過。")
-                continue
+            if not ticker: continue
                 
             preds = predict_stock_returns(df_pca, ticker)
             
@@ -262,16 +248,17 @@ def main():
                     "Status": "Success",
                     "Update_Time": datetime.now().strftime("%H:%M:%S")
                 }])
-                
                 safe_gspread_write(gc, sp_id, sheet_name, row_data, mode="append")
-                print(f"   📊 預測結果: 3天[{preds.get('3day')}%], 7天[{preds.get('7day')}%], 1月[{preds.get('1month')}%]")
+                print(f"   📊 預測結果: 3天[{preds.get('3day')}%], 1月[{preds.get('1month')}%]")
             else:
-                print(f"   ⚠️ {sheet_name} 預測失敗，跳過。")
+                print(f"   ⚠️ {sheet_name} 預測失敗或無足夠資料。")
 
-        print("\n✅ 所有 13 檔標的預測與寫入已完成！")
+        print("\n✅ 流程執行完畢！")
         
     except Exception as e:
-        print(f"\n❌ 執行發生致命錯誤:")
+        print(f"\n❌ 執行發生錯誤 (白話文診斷):")
+        print(f"⚠️ {str(e)}\n")
+        print("🔍 原始錯誤 Traceback 如下 (供工程師參考):")
         traceback.print_exc()
 
 if __name__ == "__main__":
