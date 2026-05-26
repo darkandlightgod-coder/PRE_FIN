@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-V12.1 PCA_TWII.py (多模型競技版 Model Arena)
+V12.2 PCA_TWII.py (多模型競技版 Model Arena - 智慧標題覆蓋)
 同時執行 PCA+Ridge、RandomForest、XGBoost，評估準確度(RMSE)並進行排名。
-將 3 種模型的結果直接寫入原有的「預測紀錄」分頁中。
+自動偵測舊版格式並覆蓋，確保擁有正確的欄位名稱。
 """
 import os
 import sys
@@ -96,7 +96,7 @@ def get_gspread_client():
         creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
     return gspread.authorize(creds)
 
-def safe_gspread_write(gc, sp_id, tab_name, df, mode="clear_update"):
+def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -108,15 +108,26 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="clear_update"):
                 worksheet = sh.add_worksheet(title=tab_name, rows=str(len(df)+50), cols=str(len(df.columns)+5))
             
             df = df.fillna("")
+            new_headers = df.columns.values.tolist()
             
             if mode == "clear_update":
-                data = [df.columns.values.tolist()] + df.values.tolist()
+                data = [new_headers] + df.values.tolist()
                 worksheet.clear()
                 worksheet.update(values=data, range_name=None)
+                
             elif mode == "append":
-                # 如果分頁是空的，先寫入標題
-                if not worksheet.get_all_values():
-                    worksheet.append_row(df.columns.values.tolist())
+                existing_data = worksheet.get_all_values()
+                
+                if not existing_data:
+                    # 分頁全空，先寫入標題
+                    worksheet.append_row(new_headers)
+                elif existing_data[0] != new_headers:
+                    # 💡 智慧偵測：如果舊的標題跟新標題不一樣，代表是舊格式，直接清空並寫入新標題
+                    print("     🧹 偵測到舊版格式，清空並覆寫新標題...")
+                    worksheet.clear()
+                    worksheet.append_row(new_headers)
+                
+                # 接著寫入今天的多模型預測資料
                 worksheet.append_rows(df.values.tolist())
                 
             return True
@@ -176,9 +187,6 @@ def extract_ticker(file_name):
 # 🚀 核心：多模型競技與評估 (Model Arena)
 # ==========================================
 def predict_with_arena(df_lake, ticker):
-    """
-    執行 PCA、特徵縮放，並讓 3 種模型互相比較準確度
-    """
     scaler = StandardScaler()
     X_scaled_np = scaler.fit_transform(df_lake)
     df_X_scaled = pd.DataFrame(X_scaled_np, index=df_lake.index, columns=df_lake.columns)
@@ -339,7 +347,7 @@ def main():
             
             df_rows = pd.DataFrame(rows_to_add)
             
-            # 🔥 直接寫入舊有的「預測紀錄」分頁 🔥
+            # 使用 append 模式，裡面會智慧判斷需不需要清空舊版標題
             if safe_gspread_write(gc, target_sh.id, "預測紀錄", df_rows, mode="append"):
                 best_model = rankings[0]['Model_Name']
                 print(f"   ✅ 成功寫入: {target_sh.title} (分頁: 預測紀錄)")
