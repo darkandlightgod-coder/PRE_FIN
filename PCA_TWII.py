@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-V13.4 PCA_TWII.py (跨表對齊版)
+V13.5 PCA_TWII.py (覆蓋更新與防呆版)
 - 架構更新：總經特徵 (X) 與個股目標 (Y) 跨表分離架構。
-- PRE_TWII 來自 global_market_factors。
-- 其他 13 檔股票來自 stock_history_13_targets。
-- 自動透過 Date Index 執行 Inner Join，解決台美股休假日不同步的問題。
+- 寫入優化：每日成功預測時將「清空舊資料並貼上新預測」。
+- 錯誤處理：若當日資料為空或拋出例外，保留舊資料，並在最下方附加上更新失敗的原因備註。
 """
 import os
 import sys
@@ -104,6 +103,23 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
                 worksheet.append_rows(df.values.tolist())
             return True
         except Exception as e:
+            time.sleep(2)
+    return False
+
+def append_error_note(gc, sp_id, tab_name, error_msg):
+    """在既有資料的最下方新增一行錯誤備註 (不刪除舊有資料)"""
+    for attempt in range(3):
+        try:
+            sh = gc.open_by_key(sp_id)
+            try:
+                worksheet = sh.worksheet(tab_name)
+            except gspread.exceptions.WorksheetNotFound:
+                worksheet = sh.add_worksheet(title=tab_name, rows="50", cols="10")
+            
+            # 僅寫入第一個儲存格
+            worksheet.append_row([error_msg])
+            return True
+        except Exception:
             time.sleep(2)
     return False
 
@@ -273,7 +289,7 @@ def predict_with_layered_arena(df_X, s_y):
 
 def main():
     print("="*70)
-    print("🏆 PCA x 機器學習 (雙表架構對齊版 V13.4)")
+    print("🏆 PCA x 機器學習 (雙表架構 覆寫更新版 V13.5)")
     print("="*70)
     
     try:
@@ -302,14 +318,11 @@ def main():
             raise ValueError("找不到個股目標檔案")
         df_stocks = load_sheet_as_dataframe(stock_sh) # 預設讀取第一個分頁
         print(f"   ✅ 成功載入！目標股欄位數: {len(df_stocks.columns)}, 歷史天數: {len(df_stocks)}")
-        
-        # 顯示兩邊欄位供除錯
-        print(f"\n   [除錯] df_lake 欄位預覽: {list(df_lake.columns)[:5]}...")
-        print(f"   [除錯] df_stocks 欄位預覽: {list(df_stocks.columns)[:5]}...")
 
         # 步驟 3: 循環目標並進行訓練
         print(f"\n🎯 步驟 3: 啟動跨表對齊與預測...")
         today_str = datetime.now().strftime("%Y-%m-%d")
+        today_dot = datetime.now().strftime("%Y.%m.%d") # 格式化為 20xx.xx.xx 供備註使用
         first_run_pca = None
         
         for file_name, file_url in TARGET_SPREADSHEETS.items():
@@ -321,59 +334,73 @@ def main():
                 print(f"   ❌ 找不到獨立寫入試算表 [{file_name}]，跳過。")
                 continue
             
-            # --- 判斷資料來源與特徵對齊 ---
-            df_X = df_lake.copy() # X 永遠來自總經表
-            
-            if file_name == "PRE_TWII":
-                # TWII 的目標在 df_lake
-                target_col = identify_target_column(df_lake, file_name)
-                if not target_col:
-                    print(f"   ⚠️ 在 global_market_factors 中找不到 TWII 欄位，跳過！")
+            try:
+                # --- 判斷資料來源與特徵對齊 ---
+                df_X = df_lake.copy() # X 永遠來自總經表
+                
+                if file_name == "PRE_TWII":
+                    target_col = identify_target_column(df_lake, file_name)
+                    if not target_col:
+                        msg = f"{today_dot}更新失敗：在 global_market_factors 中找不到 TWII 欄位。"
+                        print(f"   ⚠️ {msg}")
+                        append_error_note(gc, dest_sh.id, "預測紀錄", msg)
+                        continue
+                    s_y = df_lake[target_col].copy()
+                    
+                else:
+                    target_col = identify_target_column(df_stocks, file_name)
+                    if not target_col:
+                        msg = f"{today_dot}更新失敗：在 stock_history_13_targets 中找不到 '{file_name}' 的匹配欄位。"
+                        print(f"   ⚠️ {msg}")
+                        append_error_note(gc, dest_sh.id, "預測紀錄", msg)
+                        continue
+                    s_y = df_stocks[target_col].copy()
+                    
+                print(f"   🔍 對齊準備: X(總經特徵) + Y(目標: {target_col})")
+                
+                # 傳入模型進行對齊(Inner Join)與預測
+                result, df_pca_features = predict_with_layered_arena(df_X, s_y)
+                
+                # 🚨 防呆機制：若回傳為空 (代表對齊後天數嚴重不足)
+                if not result:
+                    msg = f"{today_dot}更新失敗：資料對齊合併後可用天數不足，無法預測 (可能為休假日錯位或空值過多)。"
+                    print(f"   ⚠️ {msg}")
+                    append_error_note(gc, dest_sh.id, "預測紀錄", msg)
                     continue
-                s_y = df_lake[target_col].copy()
+                    
+                if first_run_pca is None: first_run_pca = df_pca_features
                 
-            else:
-                # 其他 13 檔股票的目標在 df_stocks
-                target_col = identify_target_column(df_stocks, file_name)
-                if not target_col:
-                    print(f"   ⚠️ 在 stock_history_13_targets 中找不到 '{file_name}' 的匹配欄位，跳過！")
-                    continue
-                s_y = df_stocks[target_col].copy()
+                # 排序與組合寫入結果
+                sorted_model_names = sorted(result.keys(), key=lambda m: result[m]['Ranks'].get('Overall', 99))
+                rows_to_add = []
+                for m in sorted_model_names:
+                    res = result[m]
+                    def get_val(d, k, default="N/A", is_round=True):
+                        val = d.get(k)
+                        if val is None: return default
+                        return round(val, 2) if is_round else val
+                    
+                    rows_to_add.append({
+                        "Date": today_str, "Model_Name": m,
+                        "Overall_Rank": get_val(res['Ranks'], 'Overall', is_round=False), "Overall_RMSE": get_val(res['RMSE'], 'Overall'),
+                        "3D_Rank": get_val(res['Ranks'], '3day', is_round=False), "3D_RMSE": get_val(res['RMSE'], '3day'), "3_Days_Pred(%)": get_val(res['Preds'], '3day'),
+                        "7D_Rank": get_val(res['Ranks'], '7day', is_round=False), "7D_RMSE": get_val(res['RMSE'], '7day'), "7_Days_Pred(%)": get_val(res['Preds'], '7day'),
+                        "1M_Rank": get_val(res['Ranks'], '1month', is_round=False), "1M_RMSE": get_val(res['RMSE'], '1month'), "1_Month_Pred(%)": get_val(res['Preds'], '1month'),
+                        "1Y_Rank": get_val(res['Ranks'], '1year', is_round=False), "1Y_RMSE": get_val(res['RMSE'], '1year'), "1_Year_Pred(%)": get_val(res['Preds'], '1year'),
+                        "Status": "Success", "Update_Time": datetime.now().strftime("%H:%M:%S")
+                    })
                 
-            print(f"   🔍 對齊準備: X(總經特徵) + Y(目標: {target_col})")
-            
-            # 傳入模型進行對齊(Inner Join)與預測
-            result, df_pca_features = predict_with_layered_arena(df_X, s_y)
-            
-            if not result:
-                print(f"   ⚠️ 資料合併後天數不足，無法預測，跳過。")
-                continue
+                df_rows = pd.DataFrame(rows_to_add)
                 
-            if first_run_pca is None: first_run_pca = df_pca_features
-            
-            # 排序與寫入
-            sorted_model_names = sorted(result.keys(), key=lambda m: result[m]['Ranks'].get('Overall', 99))
-            rows_to_add = []
-            for m in sorted_model_names:
-                res = result[m]
-                def get_val(d, k, default="N/A", is_round=True):
-                    val = d.get(k)
-                    if val is None: return default
-                    return round(val, 2) if is_round else val
-                
-                rows_to_add.append({
-                    "Date": today_str, "Model_Name": m,
-                    "Overall_Rank": get_val(res['Ranks'], 'Overall', is_round=False), "Overall_RMSE": get_val(res['RMSE'], 'Overall'),
-                    "3D_Rank": get_val(res['Ranks'], '3day', is_round=False), "3D_RMSE": get_val(res['RMSE'], '3day'), "3_Days_Pred(%)": get_val(res['Preds'], '3day'),
-                    "7D_Rank": get_val(res['Ranks'], '7day', is_round=False), "7D_RMSE": get_val(res['RMSE'], '7day'), "7_Days_Pred(%)": get_val(res['Preds'], '7day'),
-                    "1M_Rank": get_val(res['Ranks'], '1month', is_round=False), "1M_RMSE": get_val(res['RMSE'], '1month'), "1_Month_Pred(%)": get_val(res['Preds'], '1month'),
-                    "1Y_Rank": get_val(res['Ranks'], '1year', is_round=False), "1Y_RMSE": get_val(res['RMSE'], '1year'), "1_Year_Pred(%)": get_val(res['Preds'], '1year'),
-                    "Status": "Success", "Update_Time": datetime.now().strftime("%H:%M:%S")
-                })
-            
-            df_rows = pd.DataFrame(rows_to_add)
-            if safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_rows, mode="append"):
-                print(f"   ✅ 成功對齊並寫入預測結果")
+                # 🌟 寫入模式改為 clear_update (先刪除全部舊內容，再貼上新表單)
+                if safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_rows, mode="clear_update"):
+                    print(f"   ✅ 成功對齊並【覆寫】最新預測結果。")
+                    
+            except Exception as e:
+                msg = f"{today_dot}更新失敗：模型運算發生非預期例外錯誤 ({str(e)})。"
+                print(f"   ⚠️ {msg}")
+                append_error_note(gc, dest_sh.id, "預測紀錄", msg)
+                traceback.print_exc()
 
         # 寫出 PCA 特徵留底
         if first_run_pca is not None:
