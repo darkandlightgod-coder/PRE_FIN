@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-V14.2 PCA_TWII.py (終極防卡死 + 即時日誌版)
+V14.4 PCA_TWII.py (新增 1D/6M 預測 + 全自動表頭覆寫版)
 - 修正項目：
-  1. 解除 Print 封印：強制 Python 解除緩衝 (line_buffering=True)，讓 Github Action 立即顯示進度。
-  2. 防止記憶體爆炸：Outer Join 前強制移除重複的 Date 索引，防堵百萬筆的笛卡爾積 (Cartesian Explosion)。
-  3. 執行緒死鎖防護：強制 XGBoost 和 RandomForest n_jobs=2，適應 Github 虛擬機的核心數。
+  1. 預測維度升級：新增 1day (隔日沖) 維度，並將 1year 改為 6month (半年波段)。
+  2. 智慧表頭對齊：寫入 Google Sheet 前，透過 Pandas 強制規範 Columns 順序，搭配 clear_update 直接全自動覆寫表頭，免除人工手動修改。
+  3. 解除 Print 封印、防止記憶體爆炸、執行緒死鎖防護。
 """
 import os
 import sys
@@ -77,7 +77,14 @@ TARGET_SPREADSHEETS = {
     "PRE_Toyota(7203.T)": ""
 }
 
-WINDOWS = {"3day": 3, "7day": 7, "1month": 22, "1year": 252}
+# 🌟 [預測維度升級] 新增 1day，將 1year 改為 6month (126個交易日)
+WINDOWS = {
+    "1day": 1, 
+    "3day": 3, 
+    "7day": 7, 
+    "1month": 21, 
+    "6month": 126
+}
 
 def get_gspread_client():
     creds_json = os.environ.get("GSPREAD_CREDENTIALS")
@@ -299,7 +306,7 @@ def predict_with_layered_arena(df_X, s_y):
 
 def main():
     print("="*70)
-    print("🏆 PCA x 機器學習 (V14.2 終極防卡死版)")
+    print("🏆 PCA x 機器學習 (V14.4 新增隔日沖與半年預測 - 自動表頭版)")
     print("="*70)
     
     try:
@@ -334,6 +341,18 @@ def main():
         print(f"\n🎯 步驟 3: 啟動特徵對齊與模型預測...")
         today_str, today_dot = datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%Y.%m.%d")
         first_run_pca, lake_sh_id = None, sh_global.id 
+        
+        # 📝 定義預期輸出的精準表頭順序 (強制約束)
+        header_order = [
+            "Date", "Model_Name", 
+            "Overall_Rank", "Overall_RMSE",
+            "1D_Rank", "1D_RMSE", "1_Day_Pred(%)",
+            "3D_Rank", "3D_RMSE", "3_Days_Pred(%)",
+            "7D_Rank", "7D_RMSE", "7_Days_Pred(%)",
+            "1M_Rank", "1M_RMSE", "1_Month_Pred(%)",
+            "6M_Rank", "6M_RMSE", "6_Months_Pred(%)",
+            "Status", "Update_Time"
+        ]
         
         for file_name, file_url in TARGET_SPREADSHEETS.items():
             print(f"\n👉 開始處理新標的: 【{file_name}】")
@@ -371,14 +390,18 @@ def main():
                     rows_to_add.append({
                         "Date": today_str, "Model_Name": m,
                         "Overall_Rank": get_val(res['Ranks'], 'Overall', False), "Overall_RMSE": get_val(res['RMSE'], 'Overall'),
+                        "1D_Rank": get_val(res['Ranks'], '1day', False), "1D_RMSE": get_val(res['RMSE'], '1day'), "1_Day_Pred(%)": get_val(res['Preds'], '1day'),
                         "3D_Rank": get_val(res['Ranks'], '3day', False), "3D_RMSE": get_val(res['RMSE'], '3day'), "3_Days_Pred(%)": get_val(res['Preds'], '3day'),
                         "7D_Rank": get_val(res['Ranks'], '7day', False), "7D_RMSE": get_val(res['RMSE'], '7day'), "7_Days_Pred(%)": get_val(res['Preds'], '7day'),
                         "1M_Rank": get_val(res['Ranks'], '1month', False), "1M_RMSE": get_val(res['RMSE'], '1month'), "1_Month_Pred(%)": get_val(res['Preds'], '1month'),
-                        "1Y_Rank": get_val(res['Ranks'], '1year', False), "1Y_RMSE": get_val(res['RMSE'], '1year'), "1_Year_Pred(%)": get_val(res['Preds'], '1year'),
+                        "6M_Rank": get_val(res['Ranks'], '6month', False), "6M_RMSE": get_val(res['RMSE'], '6month'), "6_Months_Pred(%)": get_val(res['Preds'], '6month'),
                         "Status": "Success", "Update_Time": datetime.now().strftime("%H:%M:%S")
                     })
                 
-                safe_gspread_write(gc, dest_sh.id, "預測紀錄", pd.DataFrame(rows_to_add), mode="clear_update")
+                # 📝 利用 Pandas 強制按照 header_order 排序，配合 clear_update 完全覆寫雲端表頭！
+                df_output = pd.DataFrame(rows_to_add)[header_order]
+                safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_output, mode="clear_update")
+                
             except Exception as e:
                 msg = f"{today_dot}更新崩潰 ({str(e)})。"
                 print(f"   ⚠️ {msg}")
