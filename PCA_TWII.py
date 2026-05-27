@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-V14.4 PCA_TWII.py (新增 1D/6M 預測 + 全自動表頭覆寫版)
-- 修正項目：
-  1. 預測維度升級：新增 1day (隔日沖) 維度，並將 1year 改為 6month (半年波段)。
-  2. 智慧表頭對齊：寫入 Google Sheet 前，透過 Pandas 強制規範 Columns 順序，搭配 clear_update 直接全自動覆寫表頭，免除人工手動修改。
-  3. 解除 Print 封印、防止記憶體爆炸、執行緒死鎖防護。
+V14.5 PCA_TWII.py (極速優化 + 自動表頭 + 1D/6M 預測版)
+- 效能優化 1：限制訓練資料量為近 3 年 (tail 750)，大幅縮短 PCA 與迴圈訓練時間，並過濾過期雜訊。
+- 效能優化 2：解放 n_jobs=-1，最大化 Github Actions 虛擬機多核心算力。
+- 延續功能：自動表頭對齊覆寫、記憶體防爆、即時日誌追蹤。
 """
 import os
 import sys
@@ -77,7 +76,7 @@ TARGET_SPREADSHEETS = {
     "PRE_Toyota(7203.T)": ""
 }
 
-# 🌟 [預測維度升級] 新增 1day，將 1year 改為 6month (126個交易日)
+# 🌟 [預測維度] 1day, 3day, 7day, 1month, 6month
 WINDOWS = {
     "1day": 1, 
     "3day": 3, 
@@ -166,7 +165,7 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
     df.dropna(subset=['Date'], inplace=True)
     df.set_index('Date', inplace=True)
     
-    # 🔥 [防卡死第二道防線] 強制移除重複日期！避免 outer join 造成百萬筆的矩陣爆炸
+    # 🔥 [防卡死第二道防線] 強制移除重複日期
     duplicates_count = df.index.duplicated().sum()
     if duplicates_count > 0:
         print(f"      ⚠️ [資料警告] 發現 {duplicates_count} 筆重複日期，已自動清理保留最新一筆！")
@@ -226,11 +225,15 @@ def predict_with_layered_arena(df_X, s_y):
     s_y.name = "Target_Close"
     aligned_data = pd.concat([df_X, s_y], axis=1, join='inner').dropna()
     
+    # 🚀 [極速優化 1] 斬斷歷史包袱，只取近 750 個交易日(約3年)進行訓練，大幅提升運算速度與降噪！
+    original_len = len(aligned_data)
+    aligned_data = aligned_data.tail(750)
+    print(f"      ✂️ [極速優化] 已將歷史資料由 {original_len} 筆截斷為近 {len(aligned_data)} 筆，加速訓練！")
+    
     if len(aligned_data) < 100: 
         print(f"      ⚠️ [模型警告] 對齊後資料僅 {len(aligned_data)} 筆，跳過訓練。")
         return None, None
     
-    print(f"      ⚙️ [模型進度] 資料對齊成功，共 {len(aligned_data)} 筆交易日。")
     y_raw = aligned_data["Target_Close"]
     df_aligned_X = aligned_data.drop(columns=["Target_Close"]).replace([np.inf, -np.inf], 0)
     
@@ -245,7 +248,7 @@ def predict_with_layered_arena(df_X, s_y):
     df_X_pca = pd.DataFrame(X_pca_np, index=df_aligned_X.index, columns=[f"PC{i+1}" for i in range(pca.n_components_)])
     
     merged_for_shift = pd.concat([df_X_scaled, df_X_pca, y_raw], axis=1)
-    model_names = ['PCA_Poly_Ridge', 'RandomForest', 'XGBoost']
+    model_names = ['PCA_Ridge', 'RandomForest', 'XGBoost']
     model_preds, model_rmse = {m: {} for m in model_names}, {m: {} for m in model_names} 
     
     for window_name, shift_days in WINDOWS.items():
@@ -268,22 +271,20 @@ def predict_with_layered_arena(df_X, s_y):
         X_latest_raw = merged_for_shift[df_aligned_X.columns].values[-1].reshape(1, -1)
         X_latest_pca = merged_for_shift[[f"PC{i+1}" for i in range(pca.n_components_)]].values[-1].reshape(1, -1)
         
-        # 1. Ridge
-        poly = PolynomialFeatures(degree=2, include_bias=False)
-        X_train_pca_poly = poly.fit_transform(X_pca_v[:split_idx])
-        ridge = Ridge(alpha=1.0)
-        ridge.fit(X_train_pca_poly, Y_v[:split_idx])
-        model_rmse['PCA_Poly_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], ridge.predict(poly.transform(X_pca_v[split_idx:])))))
-        model_preds['PCA_Poly_Ridge'][window_name] = round(float(ridge.predict(poly.transform(X_latest_pca))[0]), 2)
+        # 1. PCA_Ridge
+        ridge = Ridge(alpha=10.0)
+        ridge.fit(X_pca_v[:split_idx], Y_v[:split_idx])
+        model_rmse['PCA_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], ridge.predict(X_pca_v[split_idx:]))))
+        model_preds['PCA_Ridge'][window_name] = round(float(ridge.predict(X_latest_pca)[0]), 2)
         
-        # 2. RandomForest 🔥 [防卡死第三道防線] n_jobs=2 防止死鎖
-        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=2)
+        # 2. RandomForest 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心
+        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
         rf.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf.predict(X_raw_v[split_idx:]))))
         model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_raw)[0]), 2)
         
-        # 3. XGBoost 🔥 [防卡死第三道防線] n_jobs=2 防止死鎖
-        xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror', n_jobs=2)
+        # 3. XGBoost 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心
+        xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror', n_jobs=-1)
         xgb.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         model_rmse['XGBoost'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], xgb.predict(X_raw_v[split_idx:]))))
         model_preds['XGBoost'][window_name] = round(float(xgb.predict(X_latest_raw)[0]), 2)
@@ -306,7 +307,7 @@ def predict_with_layered_arena(df_X, s_y):
 
 def main():
     print("="*70)
-    print("🏆 PCA x 機器學習 (V14.4 新增隔日沖與半年預測 - 自動表頭版)")
+    print("🏆 PCA x 機器學習 (V14.5 極速優化版)")
     print("="*70)
     
     try:
@@ -398,7 +399,7 @@ def main():
                         "Status": "Success", "Update_Time": datetime.now().strftime("%H:%M:%S")
                     })
                 
-                # 📝 利用 Pandas 強制按照 header_order 排序，配合 clear_update 完全覆寫雲端表頭！
+                # 📝 利用 Pandas 強制按照 header_order 排序，配合 clear_update 完全覆寫雲端表頭
                 df_output = pd.DataFrame(rows_to_add)[header_order]
                 safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_output, mode="clear_update")
                 
