@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-V14.0 web_grab_and_language_AI_score_for_PCA.py (五年歷史回測版)
+V14.2 web_grab_and_language_AI_score_for_PCA.py (智慧增量爬取版)
 特色:
-1. 時間尺度擴大至 5 年 (1825 天)，作為機器學習長期特徵。
-2. 加入爬蟲進度條，避免長時間執行時畫面無回應。
-3. 全覆寫同步(Full-Sync)模式，新舊資料完美拼接對齊。
+1. 智慧斷點續傳：自動偵測雲端最新日期，只針對「缺漏的天數」進行補爬，大幅降低執行時間。
+2. 防封鎖機制：免除每天全量 1825 天的請求，保護 IP 不被 Google RSS 封鎖。
+3. 完美覆寫拼接：即使當日重複爬取，也會自動以最新抓取的數據覆蓋舊數據。
 """
 import os, sys, json, time, random, traceback
 import urllib.parse
@@ -26,10 +26,9 @@ CONFIG = {
     "TARGET_SHEET_NAME": "stock_history_AI_SCORE",
     
     # 追蹤的關鍵字陣列
-    
     "KEYWORDS_TO_CRAWL": ["台股", "台指期", "費半", "那斯達克", "台積電", "聯電", "遠東銀", "英業達", "美國", "戰爭", "鋼鐵", "黃金", "原油", "升息", "降息"],
     
-    # 🌟 修改為 5 年 (365天 * 5 = 1825天)
+    # 初次建置時的最大回溯天數 (5 年)
     "LOOKBACK_DAYS": 1825, 
     
     # 情緒字詞與權重
@@ -46,59 +45,55 @@ CONFIG = {
 }
 
 # ==========================================
-# 2. Google Sheet 認證與完美合併寫入
+# 2. Google Sheet 認證與雲端存取
 # ==========================================
 def get_gspread_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_json = os.environ.get("GSPREAD_CREDENTIALS")
     if not creds_json:
-        print("⚠️ 找不到 GSPREAD_CREDENTIALS 環境變數。")
+        print("⚠️ 找不到 GSPREAD_CREDENTIALS 環境變數 (可能是本機測試)。")
         raise ValueError("Missing GSPREAD_CREDENTIALS")
     return gspread.authorize(Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes))
 
-def safe_gspread_write(gc, spreadsheet_id, sheet_name, df_new):
-    print(f"\n嘗試開啟指定的試算表 ID: {spreadsheet_id}")
+def get_existing_data_and_latest_date(gc, spreadsheet_id, sheet_name):
+    """讀取雲端資料，並回傳現有 DataFrame 以及最新一筆的日期"""
+    print(f"☁️ 正在連線至雲端試算表取得最新進度...")
     try:
         wks = gc.open_by_key(spreadsheet_id).worksheet(sheet_name)
-    except WorksheetNotFound:
-        print(f"❌ 找不到分頁 [{sheet_name}]，請手動建立。")
-        return
-    except Exception as e:
-        print(f"❌ 開啟試算表失敗: {e}")
-        return
-        
-    try:
-        # 取得雲端現有資料
         existing_vals = wks.get_all_values()
         
-        # 判斷雲端資料是否包含有效的標題列 ('Date')
-        if existing_vals and len(existing_vals) > 0 and 'Date' in existing_vals[0]:
+        if existing_vals and len(existing_vals) > 1 and 'Date' in existing_vals[0]:
             headers = existing_vals[0]
             df_existing = pd.DataFrame(existing_vals[1:], columns=headers)
+            
+            # 轉換為 datetime 以尋找最大值
+            df_existing['Date'] = pd.to_datetime(df_existing['Date'], errors='coerce')
+            latest_date = df_existing['Date'].dropna().max()
+            
+            # 轉回字串格式供後續使用
+            df_existing['Date'] = df_existing['Date'].dt.strftime('%Y-%m-%d')
+            return df_existing, latest_date
         else:
-            df_existing = pd.DataFrame()
+            print("   ⚠️ 雲端表單為空，將準備進行全量初始化爬取。")
+            return pd.DataFrame(), None
+            
+    except WorksheetNotFound:
+        print(f"   ❌ 找不到分頁 [{sheet_name}]，系統將於寫入時自動建立或報錯。")
+        return pd.DataFrame(), None
+    except Exception as e:
+        print(f"   ❌ 讀取雲端進度失敗 ({e})，安全起見將回退為全量爬取。")
+        return pd.DataFrame(), None
 
-        # 將雲端資料與新抓取的資料進行完美合併
-        if not df_existing.empty:
-            df_existing['Date'] = pd.to_datetime(df_existing['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
-            df_final = pd.concat([df_existing, df_new], ignore_index=True)
-            # 若日期重複，保留最新抓取的資料
-            df_final = df_final.drop_duplicates(subset=['Date'], keep='last')
-        else:
-            df_final = df_new.copy()
-
-        # 依日期排序，處理缺失值
-        df_final['Date'] = pd.to_datetime(df_final['Date'])
-        df_final = df_final.sort_values("Date")
-        df_final['Date'] = df_final['Date'].dt.strftime('%Y-%m-%d')
-        df_final = df_final.fillna(0)
-
-        # 轉換格式並準備寫入矩陣 (第一列強制放入 columns)
+def write_cloud_data(gc, spreadsheet_id, sheet_name, df_final):
+    """將最終合併好的 DataFrame 覆寫回雲端"""
+    try:
+        wks = gc.open_by_key(spreadsheet_id).worksheet(sheet_name)
+        
+        # 轉換格式並準備寫入矩陣
         df_final_clean = df_final.astype(str).replace({"nan": "0", "NaN": "0", "NaT": ""})
         write_data = [df_final_clean.columns.tolist()] + df_final_clean.values.tolist()
         
-        # 清空工作表並一次性完整更新
-        print(f"⏳ 正在將 {len(df_final_clean)} 筆歷史資料寫入雲端 (請稍候)...")
+        print(f"\n⏳ 正在將 {len(df_final_clean)} 筆歷史資料寫入雲端 (請稍候)...")
         wks.clear()
         
         try:
@@ -106,34 +101,41 @@ def safe_gspread_write(gc, spreadsheet_id, sheet_name, df_new):
         except TypeError:
             wks.update("A1", write_data)
             
-        print(f"🟢 [{sheet_name}] 更新成功！5年歷史特徵矩陣建立完畢。")
-        
+        print(f"🟢 [{sheet_name}] 更新成功！增量數據寫入完畢。")
     except Exception:
-        print(f"❌ 寫入 {sheet_name} 時發生非預期的錯誤:")
+        print(f"❌ 寫入 {sheet_name} 時發生錯誤:")
         print(traceback.format_exc())
 
 # ==========================================
-# 3. 抓取 RSS 並計算特定關鍵字分數
+# 3. 智慧增量 RSS 爬蟲與情感運算
 # ==========================================
-def fetch_sentiment_for_keyword(keyword):
-    print(f"\n🔍 開始分析關鍵字: [{keyword}] (預計爬取 5 年資料，耗時較長請耐心等候...)")
-    scores = []
-    base_date = datetime.now()
+def fetch_sentiment_for_keyword(keyword, latest_date):
+    today = datetime.now()
     
-    # 計算有效交易日總數，用來顯示進度
+    # 判斷要爬幾天 (智慧增量邏輯)
+    if latest_date is not None:
+        # 重疊 1 天，確保最新那一天的資料有被完整更新 (因為當天可能盤中爬過，盤後又有新新聞)
+        days_to_crawl = (today - latest_date).days
+        if days_to_crawl < 0: days_to_crawl = 0
+        loop_days = days_to_crawl + 1 
+        print(f"\n🔍 [{keyword}] 偵測到雲端最新進度為 {latest_date.strftime('%Y-%m-%d')}，僅補爬最近 {loop_days} 天。")
+    else:
+        loop_days = CONFIG['LOOKBACK_DAYS']
+        print(f"\n🔍 [{keyword}] 無歷史紀錄，執行 {loop_days} 天全量回溯爬取 (耗時較長請耐心等候)...")
+
+    scores = []
     valid_days_count = 0 
     
-    for i in range(CONFIG['LOOKBACK_DAYS']):
-        d = base_date - timedelta(days=i)
+    for i in range(loop_days):
+        d = today - timedelta(days=i)
         
-        # 略過週末六日 (假設六日無開盤，新聞量也較無代表性)
+        # 略過週末六日 (假設六日無開盤，新聞量較無代表性)
         if d.weekday() >= 5: 
             continue 
             
         d_str = d.strftime("%Y-%m-%d")
         valid_days_count += 1
         
-        # 每處理 100 個交易日，印出一次進度，讓您知道程式還活著
         if valid_days_count % 100 == 0:
             print(f"   ⏳ 已往回爬取 {valid_days_count} 個交易日，目前進度至: {d_str}")
             
@@ -153,7 +155,7 @@ def fetch_sentiment_for_keyword(keyword):
                     total_weight += (bull_score - bear_score)
                 daily_score = round(total_weight / max(len(titles), 1), 4)
         except Exception:
-            # 如果遇到網路錯誤或 Google 阻擋，給予微小的隨機雜訊，避免特徵矩陣出現大破洞
+            # 遇到網路錯誤給予微小雜訊，避免特徵矩陣出現大破洞
             daily_score = round(np.random.normal(0, 0.05), 4) 
             
         scores.append({"Date": d_str, f"{keyword}_AI_SCORE": daily_score})
@@ -161,36 +163,57 @@ def fetch_sentiment_for_keyword(keyword):
         # 加入隨機延遲，避免短時間大量請求被 Google 封鎖 IP
         time.sleep(random.uniform(0.6, 1.8)) 
         
-    print(f"✅ [{keyword}] 5年歷史爬取完成！共收集 {len(scores)} 天的特徵。")
+    print(f"   ✅ [{keyword}] 爬取完成！本次收集 {len(scores)} 天的特徵。")
     return pd.DataFrame(scores)
 
 # ==========================================
 # 主程式
 # ==========================================
 def main():
-    print("="*65 + "\n📰 多關鍵字台股新聞加權字典輿情分析器 (5年歷史回測版)\n" + "="*65)
+    print("="*65 + "\n📰 多關鍵字台股新聞輿情分析器 (智慧增量版)\n" + "="*65)
     try:
-        final_df = None
-        for kw in CONFIG['KEYWORDS_TO_CRAWL']:
-            df_kw = fetch_sentiment_for_keyword(kw)
-            if final_df is None:
-                final_df = df_kw
-            else:
-                final_df = pd.merge(final_df, df_kw, on="Date", how="outer")
-                
-        # 依照日期由舊到新排序 (符合時序資料習慣)
-        final_df = final_df.sort_values("Date").fillna(0)
-        
-        if "GSPREAD_CREDENTIALS" not in os.environ:
-            print("\n⚠️ 未設定環境變數，僅預覽 DataFrame:")
-            print(final_df.tail(10)) # 顯示最新 10 筆
-            return
-
+        # 1. 取得授權並讀取舊資料庫進度
         gc = get_gspread_client()
         sp_id = CONFIG["SPREADSHEET_ID"]
         target_sheet = CONFIG["TARGET_SHEET_NAME"]
         
-        safe_gspread_write(gc, sp_id, target_sheet, final_df)
+        df_existing, latest_date = get_existing_data_and_latest_date(gc, sp_id, target_sheet)
+        
+        # 2. 爬取新資料
+        df_new = None
+        for kw in CONFIG['KEYWORDS_TO_CRAWL']:
+            df_kw = fetch_sentiment_for_keyword(kw, latest_date)
+            
+            if df_kw.empty: continue
+            
+            if df_new is None:
+                df_new = df_kw
+            else:
+                df_new = pd.merge(df_new, df_kw, on="Date", how="outer")
+                
+        # 如果根本沒有新資料 (例如今天週末，直接結束)
+        if df_new is None or df_new.empty:
+            print("\n🎉 所有資料皆已是最新狀態，無需寫入雲端！")
+            return
+
+        # 3. 完美合併新舊資料
+        print("\n🔄 正在將新抓取的數據與雲端歷史紀錄融合...")
+        if not df_existing.empty:
+            # 將新資料加到舊資料後面
+            df_final = pd.concat([df_existing, df_new], ignore_index=True)
+            # 核心：如果日期重複 (例如重疊的那一天)，保留 'last'，也就是我們剛抓的最新的數據
+            df_final = df_final.drop_duplicates(subset=['Date'], keep='last')
+        else:
+            df_final = df_new.copy()
+            
+        # 4. 排序與補零處理
+        df_final['Date'] = pd.to_datetime(df_final['Date'])
+        df_final = df_final.sort_values("Date")
+        df_final['Date'] = df_final['Date'].dt.strftime('%Y-%m-%d')
+        df_final = df_final.fillna(0)
+
+        # 5. 寫回雲端
+        write_cloud_data(gc, sp_id, target_sheet, df_final)
         
     except Exception:
         print("❌ 主程式發生錯誤:")
