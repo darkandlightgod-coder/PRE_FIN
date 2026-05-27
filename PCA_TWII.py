@@ -3,7 +3,7 @@
 V14.5 PCA_TWII.py (極速優化 + 自動表頭 + 1D/6M 預測版)
 - 效能優化 1：限制訓練資料量為近 3 年 (tail 750)，大幅縮短 PCA 與迴圈訓練時間，並過濾過期雜訊。
 - 效能優化 2：解放 n_jobs=-1，最大化 Github Actions 虛擬機多核心算力。
-- 延續功能：自動表頭對齊覆寫、記憶體防爆、即時日誌追蹤。
+- 延續功能：自動表頭對齊覆寫、記憶體防爆、即時日誌追蹤、三大模型 (Ridge/RF/XGBoost) 同台競技。
 """
 import os
 import sys
@@ -44,7 +44,7 @@ bootstrap()
 import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
@@ -58,7 +58,9 @@ try:
 except Exception:
     pass
 
-# --- 參數設定 ---
+# ==========================================
+# 參數設定區
+# ==========================================
 TARGET_SPREADSHEETS = {
     "PRE_TWII": "",         
     "PRE_台積電(2330)": "",
@@ -85,6 +87,9 @@ WINDOWS = {
     "6month": 126
 }
 
+# ==========================================
+# Google Sheet 操作函數
+# ==========================================
 def get_gspread_client():
     creds_json = os.environ.get("GSPREAD_CREDENTIALS")
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -96,6 +101,7 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
+    if not sp_id: return False
     for attempt in range(3):
         try:
             print(f"      📝 [API 進度] 準備寫入 (ID: {sp_id[:10]}...), 嘗試: {attempt+1}/3")
@@ -133,6 +139,7 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
     return False
 
 def append_error_note(gc, sp_id, tab_name, error_msg):
+    if not sp_id: return False
     for attempt in range(3):
         try:
             sh = gc.open_by_key(sp_id)
@@ -153,6 +160,8 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
         raise ValueError(f"找不到分頁。錯誤: {e}")
         
     data = ws.get_all_values()
+    if not data or len(data) < 2: return pd.DataFrame()
+    
     df = pd.DataFrame(data[1:], columns=data[0])
     
     if 'Date' not in df.columns:
@@ -220,6 +229,9 @@ def identify_target_column(df, file_name):
                 return col
     return None
 
+# ==========================================
+# 核心大腦運算
+# ==========================================
 def predict_with_layered_arena(df_X, s_y):
     print("      ⚙️ [模型進度] 啟動預測引擎...")
     s_y.name = "Target_Close"
@@ -271,24 +283,25 @@ def predict_with_layered_arena(df_X, s_y):
         X_latest_raw = merged_for_shift[df_aligned_X.columns].values[-1].reshape(1, -1)
         X_latest_pca = merged_for_shift[[f"PC{i+1}" for i in range(pca.n_components_)]].values[-1].reshape(1, -1)
         
-        # 1. PCA_Ridge
+        # 1. PCA_Ridge (使用降維後特徵)
         ridge = Ridge(alpha=10.0)
         ridge.fit(X_pca_v[:split_idx], Y_v[:split_idx])
         model_rmse['PCA_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], ridge.predict(X_pca_v[split_idx:]))))
         model_preds['PCA_Ridge'][window_name] = round(float(ridge.predict(X_latest_pca)[0]), 2)
         
-        # 2. RandomForest 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心
+        # 2. RandomForest 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心 (使用原始特徵)
         rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
         rf.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf.predict(X_raw_v[split_idx:]))))
         model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_raw)[0]), 2)
         
-        # 3. XGBoost 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心
+        # 3. XGBoost 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心 (使用原始特徵)
         xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror', n_jobs=-1)
         xgb.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         model_rmse['XGBoost'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], xgb.predict(X_raw_v[split_idx:]))))
         model_preds['XGBoost'][window_name] = round(float(xgb.predict(X_latest_raw)[0]), 2)
 
+    # 排名統計
     layers = list(WINDOWS.keys()) + ['Overall']
     for m in model_names:
         valid_rmses = [rmse for w, rmse in model_rmse[m].items() if rmse is not None]
@@ -336,7 +349,7 @@ def main():
 
         print("\n步驟 2: 載入個股歷史資料 (stock_history_13_targets)...")
         stock_sh = find_spreadsheet(gc, "stock_history_13_targets")
-        if not stock_sh: raise ValueError("找不到個股目標檔案")
+        if not stock_sh: raise ValueError("找不到個股目標檔案 stock_history_13_targets")
         df_stocks = load_sheet_as_dataframe(stock_sh)
 
         print(f"\n🎯 步驟 3: 啟動特徵對齊與模型預測...")
@@ -356,6 +369,9 @@ def main():
         ]
         
         for file_name, file_url in TARGET_SPREADSHEETS.items():
+            if not file_url: # 如果未設定 Google Sheet URL 則跳過
+                continue
+                
             print(f"\n👉 開始處理新標的: 【{file_name}】")
             dest_sh = find_spreadsheet(gc, file_name, file_url)
             if not dest_sh:
