@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-V13.9 PCA_TWII.py (終極三維特徵融合 + 報錯透明化版)
-- 報錯透明化：移除所有隱藏錯誤的 silent except，強制印出 traceback，解決「畫面卡住卻不知道錯誤原因」的問題。
-- 語法優化：移除 df.replace("") 引起的 FutureWarning，改用更安全的 to_numeric(errors='coerce')。
-- 嚴格過濾：在寫入 Google Sheets 前徹底清查 inf 與 NaN，防止 JSON 序列化失敗導致 API 拒絕請求。
+V14.0 PCA_TWII.py (終極三維特徵融合 + 報錯透明化 + 極致囉嗦追蹤版)
+- 雷達追蹤：在 PCA、機器學習模型 (RF, XGB, Ridge) 訓練的每個迴圈加入詳細 print，讓 Github Action 有心跳日誌。
+- 保留警告：應要求退回 DataFrame replace("") 語法，保留 FutureWarning 作為運行指標。
+- 致命錯誤透明化：保留完整的 traceback 印出，絕不默默卡死。
 """
 import os
 import sys
@@ -77,17 +77,20 @@ def get_gspread_client():
 def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
     for attempt in range(3):
         try:
+            print(f"      📝 [API 進度] 準備寫入 Google Sheet (ID: {sp_id[:10]}...), 嘗試次數: {attempt+1}/3")
             sh = gc.open_by_key(sp_id)
             try:
                 worksheet = sh.worksheet(tab_name)
             except gspread.exceptions.WorksheetNotFound:
+                print(f"      🆕 [API 進度] 找不到分頁 '{tab_name}'，正在建立新分頁...")
                 worksheet = sh.add_worksheet(title=tab_name, rows=str(len(df)+50), cols=str(len(df.columns)+5))
             
-            # 🌟 V13.9 嚴格清洗：將 inf 轉為 NaN，再把所有 NaN 轉為空字串，防止 Google JSON 報錯
+            # 清洗以符合 JSON 格式
             df = df.replace([np.inf, -np.inf], np.nan).fillna("")
             new_headers = df.columns.values.tolist()
             
             if mode == "clear_update":
+                print(f"      🧹 [API 進度] 清空舊資料並準備更新 {len(df)} 筆新資料...")
                 data = [new_headers] + df.values.tolist()
                 worksheet.clear()
                 worksheet.update(values=data, range_name=None)
@@ -99,13 +102,13 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
                     worksheet.clear()
                     worksheet.append_row(new_headers)
                 worksheet.append_rows(df.values.tolist())
+            print(f"      ✅ [API 進度] 寫入成功！")
             return True
         except gspread.exceptions.APIError as e:
-            print(f"   ⚠️ Google API 忙線 (錯誤碼: {e.response.status_code if hasattr(e, 'response') else 'N/A'})，等待 3 秒... ({attempt+1}/3)")
+            print(f"      ⚠️ [API 警告] Google API 忙線 (錯誤碼: {e.response.status_code if hasattr(e, 'response') else 'N/A'})，等待 3 秒... ({attempt+1}/3)")
             time.sleep(3)
         except Exception as e:
-            # 🌟 V13.9 修改：不再隱藏錯誤，強制印出詳細 traceback
-            print(f"   ❌ 寫入 Google Sheet 發生致命錯誤 (第 {attempt+1} 次): {e}")
+            print(f"      ❌ [API 致命錯誤] 寫入發生非預期錯誤:")
             traceback.print_exc()
             time.sleep(2)
     return False
@@ -121,7 +124,7 @@ def append_error_note(gc, sp_id, tab_name, error_msg):
             worksheet.append_row([error_msg])
             return True
         except Exception as e:
-            print(f"   ❌ 寫入錯誤備註時發生錯誤: {e}")
+            print(f"   ❌ 寫入錯誤備註時發生錯誤:")
             traceback.print_exc()
             time.sleep(2)
     return False
@@ -148,10 +151,9 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
     df.dropna(subset=['Date'], inplace=True)
     df.set_index('Date', inplace=True)
     
-    # 🌟 V13.9 修正：移除 replace("") 徹底解決 FutureWarning
-    # 直接使用 to_numeric 的 coerce 功能，它會自動把 "" 等無法轉換的字串變成 NaN
-    df = df.apply(pd.to_numeric, errors='coerce')
-    df.ffill(inplace=True) 
+    # 🌟 退回原本的語法，保留 FutureWarning 讓您知道它正在運行
+    print(f"      👉 [資料處理] 正在進行 replace('') 與 to_numeric 轉換...")
+    df = df.replace("", np.nan).apply(pd.to_numeric, errors='coerce').ffill()
     
     df.dropna(axis=1, how='all', inplace=True)
     df.sort_index(inplace=True)
@@ -212,23 +214,29 @@ def identify_target_column(df, file_name):
     return None
 
 def predict_with_layered_arena(df_X, s_y):
+    print("      ⚙️ [模型進度] 啟動預測引擎 (predict_with_layered_arena)...")
     s_y.name = "Target_Close"
     aligned_data = pd.concat([df_X, s_y], axis=1, join='inner').dropna()
     
     if len(aligned_data) < 100: 
+        print(f"      ⚠️ [模型警告] 對齊後資料筆數不足 100 筆 (僅 {len(aligned_data)} 筆)，跳過訓練。")
         return None, None
     
+    print(f"      ⚙️ [模型進度] 資料對齊成功，共 {len(aligned_data)} 筆有效交易日。")
     y_raw = aligned_data["Target_Close"]
     df_aligned_X = aligned_data.drop(columns=["Target_Close"])
     
-    # 防護：把 X 中的 inf 強制補 0，避免模型崩潰
+    # 防護無限大
     df_aligned_X = df_aligned_X.replace([np.inf, -np.inf], 0)
     
+    print("      📏 [模型進度] 正在執行特徵縮放 (StandardScaler)...")
     scaler = StandardScaler()
     X_scaled_np = scaler.fit_transform(df_aligned_X)
     df_X_scaled = pd.DataFrame(X_scaled_np, index=df_aligned_X.index, columns=df_aligned_X.columns)
     
-    pca = PCA(n_components=min(10, len(df_aligned_X.columns))) 
+    n_comp = min(10, len(df_aligned_X.columns))
+    print(f"      🧬 [模型進度] 正在執行 PCA 降維 (萃取 {n_comp} 個主成分)...")
+    pca = PCA(n_components=n_comp) 
     X_pca_np = pca.fit_transform(X_scaled_np)
     df_X_pca = pd.DataFrame(X_pca_np, index=df_aligned_X.index, columns=[f"PC{i+1}" for i in range(pca.n_components_)])
     
@@ -239,13 +247,15 @@ def predict_with_layered_arena(df_X, s_y):
     model_rmse = {m: {} for m in model_names} 
     
     for window_name, shift_days in WINDOWS.items():
-        # 計算未來漲幅，若因價格為0導致 inf，強制轉 NaN
+        print(f"      ⏱️ [訓練進度] ====== 開始訓練【{window_name} ({shift_days}天)】預測區間 ======")
+        
         y_target = merged_for_shift["Target_Close"].pct_change(shift_days).shift(-shift_days) * 100
         y_target = y_target.replace([np.inf, -np.inf], np.nan)
         
         valid_idx = ~y_target.isna()
         
         if valid_idx.sum() < 60:
+            print(f"         ⚠️ 無效天數過多 (剩餘 {valid_idx.sum()} 筆)，跳過此區間。")
             for m in model_names: 
                 model_preds[m][window_name] = "N/A"
                 model_rmse[m][window_name] = None
@@ -260,28 +270,34 @@ def predict_with_layered_arena(df_X, s_y):
         X_latest_raw = merged_for_shift[df_aligned_X.columns].values[-1].reshape(1, -1)
         X_latest_pca = merged_for_shift[[f"PC{i+1}" for i in range(pca.n_components_)]].values[-1].reshape(1, -1)
         
+        # 1. Ridge
+        print(f"         🧠 正在訓練: PCA_Poly_Ridge 模型...")
         poly = PolynomialFeatures(degree=2, include_bias=False)
         X_train_pca_poly = poly.fit_transform(X_pca_v[:split_idx])
         X_test_pca_poly = poly.transform(X_pca_v[split_idx:])
-        
         ridge = Ridge(alpha=1.0)
         ridge.fit(X_train_pca_poly, Y_v[:split_idx])
         r_preds_test = ridge.predict(X_test_pca_poly)
         model_rmse['PCA_Poly_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], r_preds_test)))
         model_preds['PCA_Poly_Ridge'][window_name] = round(float(ridge.predict(poly.transform(X_latest_pca))[0]), 2)
         
+        # 2. RandomForest
+        print(f"         🌲 正在訓練: RandomForest (隨機森林) 模型...")
         rf = RandomForestRegressor(n_estimators=100, random_state=42)
         rf.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         rf_preds_test = rf.predict(X_raw_v[split_idx:])
         model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf_preds_test)))
         model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_raw)[0]), 2)
         
+        # 3. XGBoost
+        print(f"         🚀 正在訓練: XGBoost (極限梯度提升) 模型...")
         xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror')
         xgb.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         xgb_preds_test = xgb.predict(X_raw_v[split_idx:])
         model_rmse['XGBoost'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], xgb_preds_test)))
         model_preds['XGBoost'][window_name] = round(float(xgb.predict(X_latest_raw)[0]), 2)
 
+    print("      🏆 [模型進度] 本標的所有模型訓練完畢，正在結算排名...")
     layers = list(WINDOWS.keys()) + ['Overall']
     for m in model_names:
         valid_rmses = [rmse for w, rmse in model_rmse[m].items() if rmse is not None]
@@ -301,7 +317,7 @@ def predict_with_layered_arena(df_X, s_y):
 
 def main():
     print("="*70)
-    print("🏆 PCA x 機器學習 (終極三維特徵融合版 V13.9 報錯全透明版)")
+    print("🏆 PCA x 機器學習 (終極三維特徵融合版 V14.0 極致追蹤版)")
     print("="*70)
     
     try:
@@ -345,14 +361,12 @@ def main():
         df_X_master = df_X_master.replace([np.inf, -np.inf], 0)
         print(f"   🔥 終極特徵矩陣融合完畢！總特徵數: {len(df_X_master.columns)}, 總天數: {len(df_X_master)}")
 
-
         print("\n步驟 2: 尋找並載入個股歷史資料 (stock_history_13_targets)...")
         stock_sh = find_spreadsheet(gc, "stock_history_13_targets")
         if not stock_sh:
             raise ValueError("找不到個股目標檔案 'stock_history_13_targets'")
         df_stocks = load_sheet_as_dataframe(stock_sh)
         print(f"   ✅ 成功載入！目標股欄位數: {len(df_stocks.columns)}")
-
 
         print(f"\n🎯 步驟 3: 啟動特徵對齊與模型預測...")
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -361,7 +375,7 @@ def main():
         lake_sh_id = sh_global.id 
         
         for file_name, file_url in TARGET_SPREADSHEETS.items():
-            print(f"\n👉 處理標的: {file_name}")
+            print(f"\n👉👉👉 開始處理新標的: 【{file_name}】 👈👈👈")
             dest_sh = find_spreadsheet(gc, file_name, file_url)
             if not dest_sh:
                 print(f"   ❌ 找不到寫入表 [{file_name}]，跳過。")
@@ -387,7 +401,7 @@ def main():
                         continue
                     s_y = df_stocks[target_col].copy()
                     
-                print(f"   🔍 對齊準備: X(三大特徵融合) + Y(目標: {target_col})")
+                print(f"   🔍 準備餵給模型: 特徵矩陣(X) + 目標欄位({target_col})")
                 
                 result, df_pca_features = predict_with_layered_arena(df_X, s_y)
                 
@@ -420,20 +434,18 @@ def main():
                 
                 df_rows = pd.DataFrame(rows_to_add)
                 
-                # 這裡如果寫入失敗，V13.9 已經會把錯誤印出來，不再沉默
                 is_success = safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_rows, mode="clear_update")
-                if is_success:
-                    print(f"   ✅ 成功對齊並【覆寫】最新預測結果。")
-                else:
+                if not is_success:
                     print(f"   ❌ 寫入失敗，請查看上方詳細報錯！")
                     
             except Exception as e:
                 msg = f"{today_dot}更新失敗：模型發生錯誤 ({str(e)})。"
-                print(f"   ⚠️ {msg}")
+                print(f"   ⚠️ 發生崩潰: {msg}")
                 traceback.print_exc()
                 append_error_note(gc, dest_sh.id, "預測紀錄", msg)
 
         if first_run_pca is not None:
+            print("\n💾 正在備份全域 PCA 特徵矩陣...")
             df_pca_output = first_run_pca.reset_index()
             df_pca_output['Date'] = df_pca_output['Date'].dt.strftime('%Y-%m-%d')
             safe_gspread_write(gc, lake_sh_id, "global_pca_features", df_pca_output, mode="clear_update")
@@ -443,7 +455,6 @@ def main():
     except Exception as e:
         print(f"\n❌ 執行發生重大錯誤:\n⚠️ {str(e)}\n")
         traceback.print_exc()
-        # 讓 Github Action 知道任務失敗，變成紅色
         sys.exit(1)
 
 if __name__ == "__main__":
