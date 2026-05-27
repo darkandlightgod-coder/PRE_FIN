@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-V14.0 PCA_TWII.py (終極三維特徵融合 + 報錯透明化 + 極致囉嗦追蹤版)
-- 雷達追蹤：在 PCA、機器學習模型 (RF, XGB, Ridge) 訓練的每個迴圈加入詳細 print，讓 Github Action 有心跳日誌。
-- 保留警告：應要求退回 DataFrame replace("") 語法，保留 FutureWarning 作為運行指標。
-- 致命錯誤透明化：保留完整的 traceback 印出，絕不默默卡死。
+V14.1 PCA_TWII.py (修正 Pandas FutureWarning 卡死問題)
+- 修正項目：移除會觸發 downcasting 警告的 replace("")，直接依賴 to_numeric(coerce) 處理空值。
+- 新增防禦：全局啟用 pd.set_option('future.no_silent_downcasting', True) 迎合新版 Pandas 標準。
+- 雷達追蹤：保留詳細的 print 心跳日誌，確保 Github Action 隨時回報進度。
 """
 import os
 import sys
@@ -14,26 +14,6 @@ import json
 import time
 import traceback
 import re
-import pandas as pd
-import numpy as np
-
-# --- 參數設定 ---
-TARGET_SPREADSHEETS = {
-    "PRE_TWII": "",         
-    "PRE_台積電(2330)": "",
-    "PRE_聯電(2303)": "",
-    "PRE_英業達(2356)": "",
-    "PRE_中鋼(2002)": "",
-    "PRE_NVIDIA(NVDA)": "",
-    "PRE_TESLA(TSLA)": "",
-    "PRE_INTEL(INTC)": "",
-    "PRE_Apple(AAPL)": "",
-    "PRE_Microsoft(MSFT)": "",
-    "PRE_Amazon(AMZN)": "",
-    "PRE_Eli Lilly(LLY)": "",
-    "PRE_Novo Nordisk(NVO)": "",
-    "PRE_Toyota(7203.T)": ""
-}
 
 def bootstrap():
     print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動環境檢查...")
@@ -53,6 +33,8 @@ def bootstrap():
 
 bootstrap()
 
+import pandas as pd
+import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.linear_model import Ridge
@@ -61,6 +43,30 @@ from sklearn.metrics import mean_squared_error
 from xgboost import XGBRegressor
 import gspread
 from google.oauth2.service_account import Credentials
+
+# 🌟 迎合新版 Pandas 標準，關閉煩人的 Downcasting 警告
+try:
+    pd.set_option('future.no_silent_downcasting', True)
+except Exception:
+    pass # 避免舊版 Pandas 報錯
+
+# --- 參數設定 ---
+TARGET_SPREADSHEETS = {
+    "PRE_TWII": "",         
+    "PRE_台積電(2330)": "",
+    "PRE_聯電(2303)": "",
+    "PRE_英業達(2356)": "",
+    "PRE_中鋼(2002)": "",
+    "PRE_NVIDIA(NVDA)": "",
+    "PRE_TESLA(TSLA)": "",
+    "PRE_INTEL(INTC)": "",
+    "PRE_Apple(AAPL)": "",
+    "PRE_Microsoft(MSFT)": "",
+    "PRE_Amazon(AMZN)": "",
+    "PRE_Eli Lilly(LLY)": "",
+    "PRE_Novo Nordisk(NVO)": "",
+    "PRE_Toyota(7203.T)": ""
+}
 
 WINDOWS = {"3day": 3, "7day": 7, "1month": 22, "1year": 252}
 
@@ -151,9 +157,9 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
     df.dropna(subset=['Date'], inplace=True)
     df.set_index('Date', inplace=True)
     
-    # 🌟 退回原本的語法，保留 FutureWarning 讓您知道它正在運行
-    print(f"      👉 [資料處理] 正在進行 replace('') 與 to_numeric 轉換...")
-    df = df.replace("", np.nan).apply(pd.to_numeric, errors='coerce').ffill()
+    # 🌟 修正點：移除 replace("")，直接依賴 to_numeric(errors='coerce') 來處理空字串，完美避開 FutureWarning
+    print(f"      👉 [資料處理] 正在進行 to_numeric 數值轉換與前向補值...")
+    df = df.apply(pd.to_numeric, errors='coerce').ffill()
     
     df.dropna(axis=1, how='all', inplace=True)
     df.sort_index(inplace=True)
@@ -317,7 +323,7 @@ def predict_with_layered_arena(df_X, s_y):
 
 def main():
     print("="*70)
-    print("🏆 PCA x 機器學習 (終極三維特徵融合版 V14.0 極致追蹤版)")
+    print("🏆 PCA x 機器學習 (V14.1 修正 Pandas 卡死版)")
     print("="*70)
     
     try:
