@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-V13.7 PCA_TWII.py (終極三維特徵融合 + API避震版)
-- 架構大升級：不再只讀取總經資料。現在會自動尋找並融合「總經」、「期貨(TAIFEX)」、「AI輿情(News)」三大特徵池。
-- API 避震：加入 find_spreadsheet 自動重試機制，防止 Google API 503/429 暫時性斷線導致崩潰。
-- 寫入優化：每日成功預測時將「清空舊資料並貼上新預測」。
-- 錯誤處理：若當日資料為空或拋錯，保留舊資料，在最下方附加更新失敗備註。
+V13.8 PCA_TWII.py (終極三維特徵融合 + API避震 + 數學防護版)
+- 數學防護：解決因資料異常(如價格為0)導致計算 pct_change 產生 Infinity(無限大) 而使模型崩潰的問題。
+- 語法優化：修復 Pandas 的 FutureWarning (Downcasting behavior in replace)。
+- API 避震：加入 find_spreadsheet 自動重試機制，防止 Google API 503 錯誤。
 """
 import os
 import sys
@@ -101,7 +100,7 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
                 worksheet.append_rows(df.values.tolist())
             return True
         except gspread.exceptions.APIError as e:
-            print(f"   ⚠️ 寫入時遇到 Google 伺服器忙線 (API Error)，等待 3 秒後重試... ({attempt+1}/3)")
+            print(f"   ⚠️ 寫入時遇到 Google 伺服器忙線，等待 3 秒後重試... ({attempt+1}/3)")
             time.sleep(3)
         except Exception:
             time.sleep(2)
@@ -142,12 +141,16 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     df.dropna(subset=['Date'], inplace=True)
     df.set_index('Date', inplace=True)
-    df = df.replace("", np.nan).apply(pd.to_numeric, errors='coerce').ffill() 
+    
+    # 🌟 V13.8 修正點 1：修復 FutureWarning，不再使用 replace("") 避免錯誤警告
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df.ffill(inplace=True) 
+    
     df.dropna(axis=1, how='all', inplace=True)
     df.sort_index(inplace=True)
     return df
 
-# 🌟 V13.7 新增：帶有「重試避震機制」的尋找檔案功能，專治 Google 503 錯誤
 def find_spreadsheet(gc, file_name, file_url=""):
     for attempt in range(3):
         try:
@@ -156,20 +159,16 @@ def find_spreadsheet(gc, file_name, file_url=""):
                     return gc.open_by_url(file_url.strip())
                 except Exception: 
                     pass
-            
-            # 使用更直接的方法呼叫 Google API，降低過度搜尋造成的負載
             return gc.open(file_name)
             
         except gspread.exceptions.SpreadsheetNotFound:
-            # 如果是真的找不到檔案，直接回傳 None，不需要重試
             return None
         except gspread.exceptions.APIError as e:
-            # 遇到 503 等 API 忙線錯誤，進行重試
             if attempt < 2:
-                print(f"   ⚠️ Google API 伺服器忙線中 (錯誤碼: {e.response.status_code})，等待 5 秒後自動重試... ({attempt+1}/3)")
+                print(f"   ⚠️ Google API 伺服器忙線中，等待 5 秒後自動重試... ({attempt+1}/3)")
                 time.sleep(5)
             else:
-                print(f"   ❌ 重試 3 次皆失敗，請稍後再試。")
+                print(f"   ❌ 重試 3 次皆失敗。")
                 raise e
         except Exception as e:
             if attempt < 2:
@@ -215,6 +214,9 @@ def predict_with_layered_arena(df_X, s_y):
     y_raw = aligned_data["Target_Close"]
     df_aligned_X = aligned_data.drop(columns=["Target_Close"])
     
+    # 🌟 V13.8 修正點 2：在特徵縮放前，清除可能存在的無限大值
+    df_aligned_X = df_aligned_X.replace([np.inf, -np.inf], 0)
+    
     scaler = StandardScaler()
     X_scaled_np = scaler.fit_transform(df_aligned_X)
     df_X_scaled = pd.DataFrame(X_scaled_np, index=df_aligned_X.index, columns=df_aligned_X.columns)
@@ -230,7 +232,10 @@ def predict_with_layered_arena(df_X, s_y):
     model_rmse = {m: {} for m in model_names} 
     
     for window_name, shift_days in WINDOWS.items():
+        # 🌟 V13.8 修正點 3：計算漲跌幅後，將除以零產生的 inf 強制轉換為 NaN，使其在下一步被過濾掉
         y_target = merged_for_shift["Target_Close"].pct_change(shift_days).shift(-shift_days) * 100
+        y_target = y_target.replace([np.inf, -np.inf], np.nan)
+        
         valid_idx = ~y_target.isna()
         
         if valid_idx.sum() < 60:
@@ -288,18 +293,14 @@ def predict_with_layered_arena(df_X, s_y):
 
 def main():
     print("="*70)
-    print("🏆 PCA x 機器學習 (終極三維特徵融合版 V13.7 API避震版)")
+    print("🏆 PCA x 機器學習 (終極三維特徵融合版 V13.8 防護避震版)")
     print("="*70)
     
     try:
         gc = get_gspread_client()
         
-        # ==========================================
-        # 步驟 1: 匯集所有 Data Lake，組成超級特徵矩陣 df_X_master
-        # ==========================================
         print("\n步驟 1: 尋找並融合三大特徵池 (總經、期貨、AI輿情)...")
         
-        # 1. 總經特徵
         df_global = pd.DataFrame()
         sh_global = find_spreadsheet(gc, "global_market_factors")
         if sh_global:
@@ -308,25 +309,18 @@ def main():
         else:
             raise ValueError("找不到核心檔案 'global_market_factors'！")
 
-        # 2. 期貨特徵 (TAIFEX)
         df_taifex = pd.DataFrame()
         sh_taifex = find_spreadsheet(gc, "taifex_derivatives_history")
         if sh_taifex:
             df_taifex = load_sheet_as_dataframe(sh_taifex)
             print(f"   ✅ [期貨] 載入成功，特徵數: {len(df_taifex.columns)}")
-        else:
-            print("   ⚠️ 找不到 'taifex_derivatives_history'，將略過此特徵。")
 
-        # 3. AI 輿情特徵
         df_ai = pd.DataFrame()
         sh_ai = find_spreadsheet(gc, "stock_history_AI_SCORE")
         if sh_ai:
             df_ai = load_sheet_as_dataframe(sh_ai)
             print(f"   ✅ [輿情] 載入成功，特徵數: {len(df_ai.columns)}")
-        else:
-            print("   ⚠️ 找不到 'stock_history_AI_SCORE'，將略過此特徵。")
 
-        # --- 融合矩陣 ---
         print("   🔄 正在將三大特徵池進行外部合併 (Outer Join)...")
         df_X_master = df_global.copy()
         
@@ -338,25 +332,20 @@ def main():
             cols_to_use = df_ai.columns.difference(df_X_master.columns)
             df_X_master = df_X_master.join(df_ai[cols_to_use], how='outer')
 
+        # 🌟 V13.8 修正點 4：在矩陣融合後，清除所有的無限大值
         df_X_master = df_X_master.sort_index().ffill().fillna(0)
+        df_X_master = df_X_master.replace([np.inf, -np.inf], 0)
         print(f"   🔥 終極特徵矩陣融合完畢！總特徵數: {len(df_X_master.columns)}, 總天數: {len(df_X_master)}")
 
 
-        # ==========================================
-        # 步驟 2: 讀取目標股 Y
-        # ==========================================
         print("\n步驟 2: 尋找並載入個股歷史資料 (stock_history_13_targets)...")
         stock_sh = find_spreadsheet(gc, "stock_history_13_targets")
         if not stock_sh:
-            print("   ⚠️ 找不到 'stock_history_13_targets'！請確認檔案名稱。")
-            raise ValueError("找不到個股目標檔案")
+            raise ValueError("找不到個股目標檔案 'stock_history_13_targets'")
         df_stocks = load_sheet_as_dataframe(stock_sh)
         print(f"   ✅ 成功載入！目標股欄位數: {len(df_stocks.columns)}")
 
 
-        # ==========================================
-        # 步驟 3: 循環標的並進行預測
-        # ==========================================
         print(f"\n🎯 步驟 3: 啟動特徵對齊與模型預測...")
         today_str = datetime.now().strftime("%Y-%m-%d")
         today_dot = datetime.now().strftime("%Y.%m.%d")
@@ -395,7 +384,7 @@ def main():
                 result, df_pca_features = predict_with_layered_arena(df_X, s_y)
                 
                 if not result:
-                    msg = f"{today_dot}更新失敗：資料對齊後天數不足無法預測。"
+                    msg = f"{today_dot}更新失敗：資料對齊後有效天數不足。"
                     print(f"   ⚠️ {msg}")
                     append_error_note(gc, dest_sh.id, "預測紀錄", msg)
                     continue
@@ -408,7 +397,7 @@ def main():
                     res = result[m]
                     def get_val(d, k, default="N/A", is_round=True):
                         val = d.get(k)
-                        if val is None: return default
+                        if val is None or pd.isna(val) or val in [np.inf, -np.inf]: return default
                         return round(val, 2) if is_round else val
                     
                     rows_to_add.append({
@@ -427,7 +416,7 @@ def main():
                     print(f"   ✅ 成功對齊並【覆寫】最新預測結果。")
                     
             except Exception as e:
-                msg = f"{today_dot}更新失敗：模型發生非預期錯誤 ({str(e)})。"
+                msg = f"{today_dot}更新失敗：模型發生錯誤 ({str(e)})。"
                 print(f"   ⚠️ {msg}")
                 append_error_note(gc, dest_sh.id, "預測紀錄", msg)
                 traceback.print_exc()
