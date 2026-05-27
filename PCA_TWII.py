@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-V13.6 PCA_TWII.py (終極三維特徵融合版)
+V13.7 PCA_TWII.py (終極三維特徵融合 + API避震版)
 - 架構大升級：不再只讀取總經資料。現在會自動尋找並融合「總經」、「期貨(TAIFEX)」、「AI輿情(News)」三大特徵池。
+- API 避震：加入 find_spreadsheet 自動重試機制，防止 Google API 503/429 暫時性斷線導致崩潰。
 - 寫入優化：每日成功預測時將「清空舊資料並貼上新預測」。
 - 錯誤處理：若當日資料為空或拋錯，保留舊資料，在最下方附加更新失敗備註。
 """
@@ -99,6 +100,9 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
                     worksheet.append_row(new_headers)
                 worksheet.append_rows(df.values.tolist())
             return True
+        except gspread.exceptions.APIError as e:
+            print(f"   ⚠️ 寫入時遇到 Google 伺服器忙線 (API Error)，等待 3 秒後重試... ({attempt+1}/3)")
+            time.sleep(3)
         except Exception:
             time.sleep(2)
     return False
@@ -143,12 +147,35 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
     df.sort_index(inplace=True)
     return df
 
+# 🌟 V13.7 新增：帶有「重試避震機制」的尋找檔案功能，專治 Google 503 錯誤
 def find_spreadsheet(gc, file_name, file_url=""):
-    if file_url.strip():
-        try: return gc.open_by_url(file_url.strip())
-        except Exception: pass
-    for f in gc.list_spreadsheet_files():
-        if f.get('name') == file_name: return gc.open_by_key(f['id'])
+    for attempt in range(3):
+        try:
+            if file_url.strip():
+                try: 
+                    return gc.open_by_url(file_url.strip())
+                except Exception: 
+                    pass
+            
+            # 使用更直接的方法呼叫 Google API，降低過度搜尋造成的負載
+            return gc.open(file_name)
+            
+        except gspread.exceptions.SpreadsheetNotFound:
+            # 如果是真的找不到檔案，直接回傳 None，不需要重試
+            return None
+        except gspread.exceptions.APIError as e:
+            # 遇到 503 等 API 忙線錯誤，進行重試
+            if attempt < 2:
+                print(f"   ⚠️ Google API 伺服器忙線中 (錯誤碼: {e.response.status_code})，等待 5 秒後自動重試... ({attempt+1}/3)")
+                time.sleep(5)
+            else:
+                print(f"   ❌ 重試 3 次皆失敗，請稍後再試。")
+                raise e
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(3)
+            else:
+                raise e
     return None
 
 def identify_target_column(df, file_name):
@@ -188,12 +215,11 @@ def predict_with_layered_arena(df_X, s_y):
     y_raw = aligned_data["Target_Close"]
     df_aligned_X = aligned_data.drop(columns=["Target_Close"])
     
-    # PCA 降維 (因現在特徵超多，PCA尤為重要)
     scaler = StandardScaler()
     X_scaled_np = scaler.fit_transform(df_aligned_X)
     df_X_scaled = pd.DataFrame(X_scaled_np, index=df_aligned_X.index, columns=df_aligned_X.columns)
     
-    pca = PCA(n_components=min(10, len(df_aligned_X.columns))) # 特徵變多，PCA維度可適度放寬至10
+    pca = PCA(n_components=min(10, len(df_aligned_X.columns))) 
     X_pca_np = pca.fit_transform(X_scaled_np)
     df_X_pca = pd.DataFrame(X_pca_np, index=df_aligned_X.index, columns=[f"PC{i+1}" for i in range(pca.n_components_)])
     
@@ -222,7 +248,6 @@ def predict_with_layered_arena(df_X, s_y):
         X_latest_raw = merged_for_shift[df_aligned_X.columns].values[-1].reshape(1, -1)
         X_latest_pca = merged_for_shift[[f"PC{i+1}" for i in range(pca.n_components_)]].values[-1].reshape(1, -1)
         
-        # 模型 1
         poly = PolynomialFeatures(degree=2, include_bias=False)
         X_train_pca_poly = poly.fit_transform(X_pca_v[:split_idx])
         X_test_pca_poly = poly.transform(X_pca_v[split_idx:])
@@ -232,14 +257,12 @@ def predict_with_layered_arena(df_X, s_y):
         model_rmse['PCA_Poly_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], r_preds_test)))
         model_preds['PCA_Poly_Ridge'][window_name] = round(float(ridge.predict(poly.transform(X_latest_pca))[0]), 2)
         
-        # 模型 2
         rf = RandomForestRegressor(n_estimators=100, random_state=42)
         rf.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         rf_preds_test = rf.predict(X_raw_v[split_idx:])
         model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf_preds_test)))
         model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_raw)[0]), 2)
         
-        # 模型 3
         xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror')
         xgb.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         xgb_preds_test = xgb.predict(X_raw_v[split_idx:])
@@ -265,7 +288,7 @@ def predict_with_layered_arena(df_X, s_y):
 
 def main():
     print("="*70)
-    print("🏆 PCA x 機器學習 (終極三維特徵融合版 V13.6)")
+    print("🏆 PCA x 機器學習 (終極三維特徵融合版 V13.7 API避震版)")
     print("="*70)
     
     try:
@@ -307,7 +330,6 @@ def main():
         print("   🔄 正在將三大特徵池進行外部合併 (Outer Join)...")
         df_X_master = df_global.copy()
         
-        # 避免欄位名稱重複衝突，採用 difference 過濾
         if not df_taifex.empty:
             cols_to_use = df_taifex.columns.difference(df_X_master.columns)
             df_X_master = df_X_master.join(df_taifex[cols_to_use], how='outer')
@@ -316,7 +338,6 @@ def main():
             cols_to_use = df_ai.columns.difference(df_X_master.columns)
             df_X_master = df_X_master.join(df_ai[cols_to_use], how='outer')
 
-        # 處理假日空洞：先往前補齊 (前一天的期貨/情緒帶入假日)，剩下的補 0
         df_X_master = df_X_master.sort_index().ffill().fillna(0)
         print(f"   🔥 終極特徵矩陣融合完畢！總特徵數: {len(df_X_master.columns)}, 總天數: {len(df_X_master)}")
 
@@ -350,11 +371,9 @@ def main():
                 continue
             
             try:
-                # 永遠使用我們剛融合好的超級矩陣作為 X
                 df_X = df_X_master.copy() 
                 
                 if file_name == "PRE_TWII":
-                    # TWII 的目標從融合大表裡找
                     target_col = identify_target_column(df_X_master, file_name)
                     if not target_col:
                         msg = f"{today_dot}更新失敗：在總經表中找不到 TWII 欄位。"
@@ -363,7 +382,6 @@ def main():
                         continue
                     s_y = df_X_master[target_col].copy()
                 else:
-                    # 個股目標從 13 檔資料表找
                     target_col = identify_target_column(df_stocks, file_name)
                     if not target_col:
                         msg = f"{today_dot}更新失敗：找不到 '{file_name}' 匹配欄位。"
