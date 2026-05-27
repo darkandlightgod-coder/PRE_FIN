@@ -3,7 +3,7 @@ name: 🚀 Financial Analysis Pipeline
 on:
   workflow_dispatch: # 手動觸發
   schedule:
-    - cron: '0 9 * * *' # 每天早上 9 點自動執行
+    - cron: '0 9 * * *' # 每天早上 9 點自動執行 (UTC 時間)
 
 jobs:
   # 統一安裝環境與快取
@@ -20,18 +20,15 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 📦 Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+      # ==========================================
+      # 🚀 優化點 1：導入極速安裝工具 uv
+      # ==========================================
+      - name: ⚡ Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
-      - name: 📦 Install Dependencies
+      - name: 📦 Install Dependencies (Using uv)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          $HOME/.cargo/bin/uv pip install --system -r requirements.txt
 
   # 爬蟲工作 (並行執行多個腳本)
   crawler:
@@ -53,23 +50,22 @@ jobs:
         with:
           python-version: ${{ needs.setup-env.outputs.python-version }}
 
-      - name: ♻️ Restore pip cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('/requirements.txt') }}
+      # ==========================================
+      # 🚀 優化點 2：每個爬蟲虛擬機也使用 uv 極速安裝
+      # ==========================================
+      - name: ⚡ Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
-      - name: 📦 Install Dependencies
+      - name: 📦 Install Dependencies (Using uv)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          $HOME/.cargo/bin/uv pip install --system -r requirements.txt
 
       - name: 🚀 Run Crawler Script
         env:
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
         run: python ${{ matrix.script }}
 
-  # 分析工作
+  # 分析工作 (大腦 PCA_TWII.py)
   analysis:
     needs: crawler
     runs-on: ubuntu-latest
@@ -82,18 +78,17 @@ jobs:
         with:
           python-version: ${{ needs.setup-env.outputs.python-version }}
 
-      - name: ♻️ Restore pip cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      # ==========================================
+      # 🚀 優化點 3：主分析機也使用 uv 極速安裝
+      # ==========================================
+      - name: ⚡ Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
-      - name: 📦 Install Dependencies
+      - name: 📦 Install Dependencies (Using uv)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          $HOME/.cargo/bin/uv pip install --system -r requirements.txt
 
-      - name: 📊 Run Prediction Analysis
+      - name: 📊 Run PCA and Prediction (V14.5 極速版)
         env:
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
         run: python PCA_TWII.py
