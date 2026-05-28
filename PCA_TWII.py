@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-V14.6 PLS_TWII.py (監督式降維 PLS + 多核心平行運算 + 時光機防護版)
+V14.6.1 PLS_TWII.py (監督式降維 PLS + 多核心平行運算 + 時光機防護版)
+- 修正：修復任務清單收集邏輯，支援僅透過檔名 (file_name) 搜尋目標表格，正確觸發多核心運算。
 - 演算法升級：捨棄無監督的 PCA，改採 PLS 偏最小平方法，降維時強制考慮預測目標 (y)，歐幾里得距離更精準。
 - 防作弊機制：嚴格執行 Train/Test 時間切分，僅用過去資料訓練 PLS 與 XGBoost，杜絕未來數據洩漏。
 - 極速並行：導入 ProcessPoolExecutor，多檔股票同時平行運算，抵銷 PLS 帶來的計算量負擔。
-- 延續功能：自動表頭對齊覆寫、記憶體防爆。
 """
 import os
 import sys
@@ -229,6 +229,7 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
         print(f"      ⚙️ [{file_name}] 啟動 PLS 預測引擎...")
         target_col = identify_target_column(df_X_master if file_name == "PRE_TWII" else df_stocks, file_name)
         if not target_col:
+            print(f"      ⚠️ [{file_name}] 找不到目標欄位。")
             return file_name, None
             
         s_y = (df_X_master if file_name == "PRE_TWII" else df_stocks)[target_col].copy()
@@ -241,6 +242,7 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
         aligned_data = aligned_data.tail(750)
         
         if len(aligned_data) < 100: 
+            print(f"      ⚠️ [{file_name}] 有效資料不足 100 筆。")
             return file_name, None
         
         y_raw = aligned_data["Target_Close"]
@@ -280,7 +282,6 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
             X_latest_scaled = scaler.transform(X_latest_raw)
             
             # 2. 🎯 核心升級：PLS 監督式降維 🎯
-            # 同時參考 X 與 y，針對該標的量身打造特徵
             n_comp = min(10, X_train_scaled.shape[1])
             pls = PLSRegression(n_components=n_comp)
             
@@ -288,9 +289,7 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
             X_test_pls = pls.transform(X_test_scaled)
             X_latest_pls = pls.transform(X_latest_scaled)
             
-            # ===============================================
             # 3. 建立模型 (全面改吃 PLS 量身打造出來的濃縮特徵)
-            # ===============================================
             # (A) PLS_Poly_Ridge
             X_train_pls_poly = poly.fit_transform(X_train_pls)
             X_test_pls_poly = poly.transform(X_test_pls)
@@ -301,7 +300,7 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
             model_rmse['PLS_Poly_Ridge'][window_name] = float(np.sqrt(mean_squared_error(y_test, ridge.predict(X_test_pls_poly))))
             model_preds['PLS_Poly_Ridge'][window_name] = round(float(ridge.predict(X_latest_pls_poly)[0]), 2)
             
-            # (B) RandomForest (內部設 n_jobs=1，因為外層已開啟多進程)
+            # (B) RandomForest
             rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=1)
             rf.fit(X_train_pls, y_train)
             model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(y_test, rf.predict(X_test_pls))))
@@ -342,7 +341,7 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
 # ==========================================
 def main():
     print("="*70)
-    print("🏆 PLS x 機器學習 (V14.6 監督式降維 + 多核心平行極速版)")
+    print("🏆 PLS x 機器學習 (V14.6.1 監督式降維 + 多核心平行極速版)")
     print("="*70)
     
     try:
@@ -377,16 +376,13 @@ def main():
         print(f"\n🎯 步驟 3: 啟動 PLS 多核心平行運算引擎...")
         today_str, today_dot = datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%Y.%m.%d")
         
-        # 收集工作清單
-        tasks = []
-        for file_name, file_url in TARGET_SPREADSHEETS.items():
-            if file_url: 
-                tasks.append(file_name)
+        # 🚀 修正：將 TARGET_SPREADSHEETS 所有的 key (檔名) 列入任務清單，無視 file_url 空字串
+        tasks = list(TARGET_SPREADSHEETS.keys())
+        print(f"   📋 共獲取 {len(tasks)} 檔標的排隊進入引擎。")
                 
         results_map = {}
         
-        # 🚀 啟動多核心運算 (ProcessPoolExecutor)
-        # GitHub Actions 虛擬機支援多線程，這會大幅縮短 14 檔股票的 PLS 訓練時間
+        # 啟動多核心運算 (ProcessPoolExecutor)
         with concurrent.futures.ProcessPoolExecutor() as executor:
             futures = []
             for file_name in tasks:
@@ -412,11 +408,14 @@ def main():
         ]
         
         for file_name, file_url in TARGET_SPREADSHEETS.items():
-            if not file_url or file_name not in results_map:
+            if file_name not in results_map:
+                print(f"   ⏭️ [{file_name}] 無預測結果，跳過。")
                 continue
                 
+            print(f"\n👉 尋找並準備寫入: 【{file_name}】")
             dest_sh = find_spreadsheet(gc, file_name, file_url)
             if not dest_sh:
+                print(f"   ❌ 雲端找不到檔案 '{file_name}'，寫入失敗。")
                 continue
                 
             result = results_map[file_name]
@@ -442,7 +441,7 @@ def main():
             df_output = pd.DataFrame(rows_to_add)[header_order]
             safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_output, mode="clear_update")
             
-        print("\n✅ 所有流程完畢！V14.6 系統已登出。")
+        print("\n✅ 所有流程完畢！V14.6.1 系統已登出。")
         
     except Exception as e:
         print(f"\n❌ 重大錯誤:\n⚠️ {str(e)}\n")
