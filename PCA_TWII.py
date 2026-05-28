@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-V14.4 PCA_TWII.py (新增 1D/6M 預測 + 全自動表頭覆寫版)
-- 修正項目：
-  1. 預測維度升級：新增 1day (隔日沖) 維度，並將 1year 改為 6month (半年波段)。
-  2. 智慧表頭對齊：寫入 Google Sheet 前，透過 Pandas 強制規範 Columns 順序，搭配 clear_update 直接全自動覆寫表頭，免除人工手動修改。
-  3. 解除 Print 封印、防止記憶體爆炸、執行緒死鎖防護。
+V14.5 PCA_TWII.py (極速優化 + 自動表頭 + 1D/6M 預測版)
+- 效能優化 1：限制訓練資料量為近 3 年 (tail 750)，大幅縮短 PCA 與迴圈訓練時間，並過濾過期雜訊。
+- 效能優化 2：解放 n_jobs=-1，最大化 Github Actions 虛擬機多核心算力。
+- 延續功能：自動表頭對齊覆寫、記憶體防爆、即時日誌追蹤、三大模型 (Ridge/RF/XGBoost) 同台競技。
 """
 import os
 import sys
@@ -45,7 +44,7 @@ bootstrap()
 import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
@@ -59,7 +58,9 @@ try:
 except Exception:
     pass
 
-# --- 參數設定 ---
+# ==========================================
+# 參數設定區
+# ==========================================
 TARGET_SPREADSHEETS = {
     "PRE_TWII": "",         
     "PRE_台積電(2330)": "",
@@ -77,7 +78,7 @@ TARGET_SPREADSHEETS = {
     "PRE_Toyota(7203.T)": ""
 }
 
-# 🌟 [預測維度升級] 新增 1day，將 1year 改為 6month (126個交易日)
+# 🌟 [預測維度] 1day, 3day, 7day, 1month, 6month
 WINDOWS = {
     "1day": 1, 
     "3day": 3, 
@@ -86,6 +87,9 @@ WINDOWS = {
     "6month": 126
 }
 
+# ==========================================
+# Google Sheet 操作函數
+# ==========================================
 def get_gspread_client():
     creds_json = os.environ.get("GSPREAD_CREDENTIALS")
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -97,6 +101,7 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
+    if not sp_id: return False
     for attempt in range(3):
         try:
             print(f"      📝 [API 進度] 準備寫入 (ID: {sp_id[:10]}...), 嘗試: {attempt+1}/3")
@@ -134,6 +139,7 @@ def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
     return False
 
 def append_error_note(gc, sp_id, tab_name, error_msg):
+    if not sp_id: return False
     for attempt in range(3):
         try:
             sh = gc.open_by_key(sp_id)
@@ -154,6 +160,8 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
         raise ValueError(f"找不到分頁。錯誤: {e}")
         
     data = ws.get_all_values()
+    if not data or len(data) < 2: return pd.DataFrame()
+    
     df = pd.DataFrame(data[1:], columns=data[0])
     
     if 'Date' not in df.columns:
@@ -166,7 +174,7 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
     df.dropna(subset=['Date'], inplace=True)
     df.set_index('Date', inplace=True)
     
-    # 🔥 [防卡死第二道防線] 強制移除重複日期！避免 outer join 造成百萬筆的矩陣爆炸
+    # 🔥 [防卡死第二道防線] 強制移除重複日期
     duplicates_count = df.index.duplicated().sum()
     if duplicates_count > 0:
         print(f"      ⚠️ [資料警告] 發現 {duplicates_count} 筆重複日期，已自動清理保留最新一筆！")
@@ -221,16 +229,23 @@ def identify_target_column(df, file_name):
                 return col
     return None
 
+# ==========================================
+# 核心大腦運算
+# ==========================================
 def predict_with_layered_arena(df_X, s_y):
     print("      ⚙️ [模型進度] 啟動預測引擎...")
     s_y.name = "Target_Close"
     aligned_data = pd.concat([df_X, s_y], axis=1, join='inner').dropna()
     
+    # 🚀 [極速優化 1] 斬斷歷史包袱，只取近 750 個交易日(約3年)進行訓練，大幅提升運算速度與降噪！
+    original_len = len(aligned_data)
+    aligned_data = aligned_data.tail(750)
+    print(f"      ✂️ [極速優化] 已將歷史資料由 {original_len} 筆截斷為近 {len(aligned_data)} 筆，加速訓練！")
+    
     if len(aligned_data) < 100: 
         print(f"      ⚠️ [模型警告] 對齊後資料僅 {len(aligned_data)} 筆，跳過訓練。")
         return None, None
     
-    print(f"      ⚙️ [模型進度] 資料對齊成功，共 {len(aligned_data)} 筆交易日。")
     y_raw = aligned_data["Target_Close"]
     df_aligned_X = aligned_data.drop(columns=["Target_Close"]).replace([np.inf, -np.inf], 0)
     
@@ -245,7 +260,7 @@ def predict_with_layered_arena(df_X, s_y):
     df_X_pca = pd.DataFrame(X_pca_np, index=df_aligned_X.index, columns=[f"PC{i+1}" for i in range(pca.n_components_)])
     
     merged_for_shift = pd.concat([df_X_scaled, df_X_pca, y_raw], axis=1)
-    model_names = ['PCA_Poly_Ridge', 'RandomForest', 'XGBoost']
+    model_names = ['PCA_Ridge', 'RandomForest', 'XGBoost']
     model_preds, model_rmse = {m: {} for m in model_names}, {m: {} for m in model_names} 
     
     for window_name, shift_days in WINDOWS.items():
@@ -268,26 +283,25 @@ def predict_with_layered_arena(df_X, s_y):
         X_latest_raw = merged_for_shift[df_aligned_X.columns].values[-1].reshape(1, -1)
         X_latest_pca = merged_for_shift[[f"PC{i+1}" for i in range(pca.n_components_)]].values[-1].reshape(1, -1)
         
-        # 1. Ridge
-        poly = PolynomialFeatures(degree=2, include_bias=False)
-        X_train_pca_poly = poly.fit_transform(X_pca_v[:split_idx])
-        ridge = Ridge(alpha=1.0)
-        ridge.fit(X_train_pca_poly, Y_v[:split_idx])
-        model_rmse['PCA_Poly_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], ridge.predict(poly.transform(X_pca_v[split_idx:])))))
-        model_preds['PCA_Poly_Ridge'][window_name] = round(float(ridge.predict(poly.transform(X_latest_pca))[0]), 2)
+        # 1. PCA_Ridge (使用降維後特徵)
+        ridge = Ridge(alpha=10.0)
+        ridge.fit(X_pca_v[:split_idx], Y_v[:split_idx])
+        model_rmse['PCA_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], ridge.predict(X_pca_v[split_idx:]))))
+        model_preds['PCA_Ridge'][window_name] = round(float(ridge.predict(X_latest_pca)[0]), 2)
         
-        # 2. RandomForest 🔥 [防卡死第三道防線] n_jobs=2 防止死鎖
-        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=2)
+        # 2. RandomForest 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心 (使用原始特徵)
+        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
         rf.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf.predict(X_raw_v[split_idx:]))))
         model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_raw)[0]), 2)
         
-        # 3. XGBoost 🔥 [防卡死第三道防線] n_jobs=2 防止死鎖
-        xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror', n_jobs=2)
+        # 3. XGBoost 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心 (使用原始特徵)
+        xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror', n_jobs=-1)
         xgb.fit(X_raw_v[:split_idx], Y_v[:split_idx])
         model_rmse['XGBoost'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], xgb.predict(X_raw_v[split_idx:]))))
         model_preds['XGBoost'][window_name] = round(float(xgb.predict(X_latest_raw)[0]), 2)
 
+    # 排名統計
     layers = list(WINDOWS.keys()) + ['Overall']
     for m in model_names:
         valid_rmses = [rmse for w, rmse in model_rmse[m].items() if rmse is not None]
@@ -306,7 +320,7 @@ def predict_with_layered_arena(df_X, s_y):
 
 def main():
     print("="*70)
-    print("🏆 PCA x 機器學習 (V14.4 新增隔日沖與半年預測 - 自動表頭版)")
+    print("🏆 PCA x 機器學習 (V14.5 極速優化版)")
     print("="*70)
     
     try:
@@ -335,7 +349,7 @@ def main():
 
         print("\n步驟 2: 載入個股歷史資料 (stock_history_13_targets)...")
         stock_sh = find_spreadsheet(gc, "stock_history_13_targets")
-        if not stock_sh: raise ValueError("找不到個股目標檔案")
+        if not stock_sh: raise ValueError("找不到個股目標檔案 stock_history_13_targets")
         df_stocks = load_sheet_as_dataframe(stock_sh)
 
         print(f"\n🎯 步驟 3: 啟動特徵對齊與模型預測...")
@@ -355,6 +369,9 @@ def main():
         ]
         
         for file_name, file_url in TARGET_SPREADSHEETS.items():
+            if not file_url: # 如果未設定 Google Sheet URL 則跳過
+                continue
+                
             print(f"\n👉 開始處理新標的: 【{file_name}】")
             dest_sh = find_spreadsheet(gc, file_name, file_url)
             if not dest_sh:
@@ -398,7 +415,7 @@ def main():
                         "Status": "Success", "Update_Time": datetime.now().strftime("%H:%M:%S")
                     })
                 
-                # 📝 利用 Pandas 強制按照 header_order 排序，配合 clear_update 完全覆寫雲端表頭！
+                # 📝 利用 Pandas 強制按照 header_order 排序，配合 clear_update 完全覆寫雲端表頭
                 df_output = pd.DataFrame(rows_to_add)[header_order]
                 safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_output, mode="clear_update")
                 
