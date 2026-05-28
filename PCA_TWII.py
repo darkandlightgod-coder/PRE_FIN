@@ -1,441 +1,155 @@
 # -*- coding: utf-8 -*-
 """
-V14.5 PCA_TWII.py (極速優化 + 自動表頭 + 1D/6M 預測版)
-- 效能優化 1：限制訓練資料量為近 3 年 (tail 750)，大幅縮短 PCA 與迴圈訓練時間，並過濾過期雜訊。
-- 效能優化 2：解放 n_jobs=-1，最大化 Github Actions 虛擬機多核心算力。
-- 延續功能：自動表頭對齊覆寫、記憶體防爆、即時日誌追蹤、三大模型 (Ridge/RF/XGBoost) 同台競技。
+V14.6 PLS 監督式降維引擎 (多核心極速版)
+特色:
+1. 演算法升級：從無監督的 PCA 升級為監督式的 PLS (偏最小平方法)，降維時會參考目標 y。
+2. 防未來數據洩漏：嚴格執行 Train/Test 切分後再進行 PLS Fit。
+3. 極速優化：導入 ProcessPoolExecutor，多檔股票平行運算。
 """
 import os
-import sys
-import io
-import subprocess
-import importlib
-from datetime import datetime
-import json
-import time
-import traceback
-import re
-
-# 🔥 [防卡死第一道防線] 強制 Python 立即吐出所有 print 日誌，拒絕 GitHub Actions 隱藏輸出！
-try:
-    if isinstance(sys.stdout, io.TextIOWrapper):
-        sys.stdout.reconfigure(line_buffering=True)
-except Exception:
-    pass
-
-def bootstrap():
-    print(f"🛠️ [{datetime.now().strftime('%H:%M:%S')}] 啟動環境檢查...")
-    dependencies = {
-        "pandas": "pandas", "numpy": "numpy", "sklearn": "scikit-learn",
-        "xgboost": "xgboost", "gspread": "gspread", "google.oauth2.service_account": "google-auth"
-    }
-    installed_any = False
-    for module, package in dependencies.items():
-        try:
-            importlib.import_module(module)
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
-            installed_any = True
-    if installed_any:
-        importlib.invalidate_caches()
-
-bootstrap()
-
 import pandas as pd
 import numpy as np
-from sklearn.decomposition import PCA
+import traceback
+from datetime import datetime
+from sklearn.cross_decomposition import PLSRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
 from xgboost import XGBRegressor
-import gspread
-from google.oauth2.service_account import Credentials
-
-# 🌟 迎合新版 Pandas 標準，關閉煩人的 Downcasting 警告
-try:
-    pd.set_option('future.no_silent_downcasting', True)
-except Exception:
-    pass
+import concurrent.futures
 
 # ==========================================
-# 參數設定區
+# 參數設定
 # ==========================================
-TARGET_SPREADSHEETS = {
-    "PRE_TWII": "",         
-    "PRE_台積電(2330)": "",
-    "PRE_聯電(2303)": "",
-    "PRE_英業達(2356)": "",
-    "PRE_中鋼(2002)": "",
-    "PRE_NVIDIA(NVDA)": "",
-    "PRE_TESLA(TSLA)": "",
-    "PRE_INTEL(INTC)": "",
-    "PRE_Apple(AAPL)": "",
-    "PRE_Microsoft(MSFT)": "",
-    "PRE_Amazon(AMZN)": "",
-    "PRE_Eli Lilly(LLY)": "",
-    "PRE_Novo Nordisk(NVO)": "",
-    "PRE_Toyota(7203.T)": ""
+N_COMPONENTS = 10     # PLS 要降成幾個特徵 (等同於之前的 PCA 數量)
+TRAIN_RATIO = 0.8     # 80% 資料作為訓練集(Train)，20% 作為測試集(Test)
+
+# 預測維度設定 (天數)
+PREDICT_HORIZONS = {
+    '1day': 1,
+    '7day': 7,
+    '1month': 22,   # 交易日
+    '6month': 126   # 交易日
 }
 
-# 🌟 [預測維度] 1day, 3day, 7day, 1month, 6month
-WINDOWS = {
-    "1day": 1, 
-    "3day": 3, 
-    "7day": 7, 
-    "1month": 21, 
-    "6month": 126
-}
-
-# ==========================================
-# Google Sheet 操作函數
-# ==========================================
-def get_gspread_client():
-    creds_json = os.environ.get("GSPREAD_CREDENTIALS")
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    if creds_json:
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
-    return gspread.authorize(creds)
-
-def safe_gspread_write(gc, sp_id, tab_name, df, mode="append"):
-    if not sp_id: return False
-    for attempt in range(3):
-        try:
-            print(f"      📝 [API 進度] 準備寫入 (ID: {sp_id[:10]}...), 嘗試: {attempt+1}/3")
-            sh = gc.open_by_key(sp_id)
-            try:
-                worksheet = sh.worksheet(tab_name)
-            except gspread.exceptions.WorksheetNotFound:
-                print(f"      🆕 [API 進度] 找不到分頁 '{tab_name}'，正在建立新分頁...")
-                worksheet = sh.add_worksheet(title=tab_name, rows=str(len(df)+50), cols=str(len(df.columns)+5))
-            
-            df = df.replace([np.inf, -np.inf], np.nan).fillna("")
-            new_headers = df.columns.values.tolist()
-            
-            if mode == "clear_update":
-                data = [new_headers] + df.values.tolist()
-                worksheet.clear()
-                worksheet.update(values=data, range_name=None)
-            elif mode == "append":
-                existing_data = worksheet.get_all_values()
-                if not existing_data:
-                    worksheet.append_row(new_headers)
-                elif existing_data[0] != new_headers:
-                    worksheet.clear()
-                    worksheet.append_row(new_headers)
-                worksheet.append_rows(df.values.tolist())
-            print(f"      ✅ [API 進度] 寫入成功！")
-            return True
-        except gspread.exceptions.APIError as e:
-            print(f"      ⚠️ [API 警告] Google API 忙線，等待 3 秒... ({attempt+1}/3)")
-            time.sleep(3)
-        except Exception as e:
-            print(f"      ❌ [API 致命錯誤] 寫入發生非預期錯誤:")
-            traceback.print_exc()
-            time.sleep(2)
-    return False
-
-def append_error_note(gc, sp_id, tab_name, error_msg):
-    if not sp_id: return False
-    for attempt in range(3):
-        try:
-            sh = gc.open_by_key(sp_id)
-            try:
-                worksheet = sh.worksheet(tab_name)
-            except gspread.exceptions.WorksheetNotFound:
-                worksheet = sh.add_worksheet(title=tab_name, rows="50", cols="10")
-            worksheet.append_row([error_msg])
-            return True
-        except Exception:
-            time.sleep(2)
-    return False
-
-def load_sheet_as_dataframe(sh, worksheet_name=None):
+def process_single_target(target_name, df_X, series_y):
+    """
+    這是一個獨立的工作單元，設計成可以在多核心下平行執行。
+    負責：特徵對齊 -> Train/Test 切分 -> PLS 降維 -> XGBoost 預測。
+    """
+    print(f"啟動平行運算: 處理標的 [{target_name}] ...")
+    results = {'Target': target_name}
+    
     try:
-        ws = sh.worksheet(worksheet_name) if worksheet_name else sh.get_worksheet(0)
+        # 1. 對齊 X 和 y 的日期 (只保留兩者都有資料的日子)
+        df_merged = pd.concat([df_X, series_y.rename('Target_Y')], axis=1).dropna()
+        X_aligned = df_merged.drop(columns=['Target_Y']).values
+        y_aligned = df_merged['Target_Y'].values
+        
+        # 取得最後一天的特徵，用來預測「真正的未來」
+        X_latest_unscaled = X_aligned[-1].reshape(1, -1)
+        
+        for horizon_name, shift_days in PREDICT_HORIZONS.items():
+            # 2. 建立預測目標 (將 y 往上推 shift_days 天)
+            # 例如預測 7 天後，今天的 X 要對應到 7 天後的 y
+            y_horizon = pd.Series(y_aligned).shift(-shift_days).values
+            
+            # 剔除最後因為 shift 產生 NaN 的天數
+            valid_idx = ~np.isnan(y_horizon)
+            X_valid = X_aligned[valid_idx]
+            y_valid = y_horizon[valid_idx]
+            
+            if len(X_valid) < 100:
+                continue # 資料太少，跳過
+                
+            # 3. 嚴格的時間切分 (Time-Series Split)
+            # 絕對不能用 random_state 隨機切分，否則會用未來的資料預測過去！
+            split_idx = int(len(X_valid) * TRAIN_RATIO)
+            X_train, X_test = X_valid[:split_idx], X_valid[split_idx:]
+            y_train, y_test = y_valid[:split_idx], y_valid[split_idx:]
+            
+            # 4. 特徵縮放 (只能 Fit 在 Train Set)
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            X_latest_scaled = scaler.transform(X_latest_unscaled) # 今天的最新數據
+            
+            # 5. 🔥 核心升級：PLS 監督式降維 🔥
+            # PLS 會偷看 y_train，找出 X 中最能解釋 y 的方向
+            n_comp = min(N_COMPONENTS, X_train_scaled.shape[1])
+            pls = PLSRegression(n_components=n_comp)
+            
+            X_train_pls = pls.fit_transform(X_train_scaled, y_train)[0]
+            X_test_pls = pls.transform(X_test_scaled)
+            X_latest_pls = pls.transform(X_latest_scaled)
+            
+            # 6. XGBoost 訓練與預測
+            model = XGBRegressor(n_estimators=100, learning_rate=0.05, n_jobs=1, random_state=42)
+            model.fit(X_train_pls, y_train)
+            
+            # 測試集驗證 (RMSE)
+            test_preds = model.predict(X_test_pls)
+            rmse = np.sqrt(mean_squared_error(y_test, test_preds))
+            
+            # 預測未來真實股價 (拿最後一天的特徵去預測)
+            future_pred = model.predict(X_latest_pls)[0]
+            current_price = y_aligned[-1]
+            pred_return_pct = ((future_pred - current_price) / current_price) * 100
+            
+            # 儲存結果
+            results[f"{horizon_name}_RMSE"] = round(rmse, 2)
+            results[f"{horizon_name}_Pred_Price"] = round(future_pred, 2)
+            results[f"{horizon_name}_Pred_Return(%)"] = round(pred_return_pct, 2)
+            
+        results['Status'] = "Success"
+        
     except Exception as e:
-        raise ValueError(f"找不到分頁。錯誤: {e}")
+        results['Status'] = "Failed"
+        results['Error'] = str(e)
         
-    data = ws.get_all_values()
-    if not data or len(data) < 2: return pd.DataFrame()
-    
-    df = pd.DataFrame(data[1:], columns=data[0])
-    
-    if 'Date' not in df.columns:
-        if '日期' in df.columns:
-            df.rename(columns={'日期': 'Date'}, inplace=True)
-        else:
-            df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
-    
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    df.dropna(subset=['Date'], inplace=True)
-    df.set_index('Date', inplace=True)
-    
-    # 🔥 [防卡死第二道防線] 強制移除重複日期
-    duplicates_count = df.index.duplicated().sum()
-    if duplicates_count > 0:
-        print(f"      ⚠️ [資料警告] 發現 {duplicates_count} 筆重複日期，已自動清理保留最新一筆！")
-        df = df[~df.index.duplicated(keep='last')]
-    
-    print(f"      👉 [資料處理] 正在進行 to_numeric 數值轉換與前向補值...")
-    df = df.apply(pd.to_numeric, errors='coerce').ffill()
-    df.dropna(axis=1, how='all', inplace=True)
-    df.sort_index(inplace=True)
-    return df
+    return results
 
-def find_spreadsheet(gc, file_name, file_url=""):
-    for attempt in range(3):
-        try:
-            if file_url.strip():
-                try: 
-                    return gc.open_by_url(file_url.strip())
-                except Exception: 
-                    pass
-            return gc.open(file_name)
-        except gspread.exceptions.SpreadsheetNotFound:
-            return None
-        except gspread.exceptions.APIError:
-            if attempt < 2: time.sleep(5)
-        except Exception:
-            if attempt < 2: time.sleep(3)
-    return None
-
-def identify_target_column(df, file_name):
-    candidates = []
-    if "TWII" in file_name:
-        candidates = ["^twii", "twii", "加權指數", "大盤"]
-    else:
-        match = re.search(r'PRE_(.*?)\((.*?)\)', file_name)
-        if match:
-            name, ticker = match.group(1).strip(), match.group(2).strip()
-            if name: candidates.append(name)
-            if ticker: candidates.append(ticker)
-        else:
-            candidates.append(file_name.replace("PRE_", ""))
-            
-    for col in df.columns:
-        col_lower = str(col).lower()
-        for cand in candidates:
-            if cand.lower() in col_lower and ("close" in col_lower or "收盤" in col_lower):
-                return col
-                
-    for col in df.columns:
-        col_lower = str(col).lower()
-        for cand in candidates:
-            if cand.lower() in col_lower and "volume" not in col_lower and "成交量" not in col_lower:
-                return col
-    return None
-
-# ==========================================
-# 核心大腦運算
-# ==========================================
-def predict_with_layered_arena(df_X, s_y):
-    print("      ⚙️ [模型進度] 啟動預測引擎...")
-    s_y.name = "Target_Close"
-    aligned_data = pd.concat([df_X, s_y], axis=1, join='inner').dropna()
+def run_pls_pipeline(df_X_master, dict_y_targets):
+    """
+    主控制程式：負責派發工作給多個 CPU 核心
+    df_X_master: 所有的總經與市場特徵 DataFrame (Index為日期)
+    dict_y_targets: 字典格式 {'2330.TW': Series, 'NVDA': Series, ...}
+    """
+    print(f"🚀 啟動 V14.6 PLS 分析引擎，共有 {len(dict_y_targets)} 檔標的等待處理。")
+    final_results = []
     
-    # 🚀 [極速優化 1] 斬斷歷史包袱，只取近 750 個交易日(約3年)進行訓練，大幅提升運算速度與降噪！
-    original_len = len(aligned_data)
-    aligned_data = aligned_data.tail(750)
-    print(f"      ✂️ [極速優化] 已將歷史資料由 {original_len} 筆截斷為近 {len(aligned_data)} 筆，加速訓練！")
-    
-    if len(aligned_data) < 100: 
-        print(f"      ⚠️ [模型警告] 對齊後資料僅 {len(aligned_data)} 筆，跳過訓練。")
-        return None, None
-    
-    y_raw = aligned_data["Target_Close"]
-    df_aligned_X = aligned_data.drop(columns=["Target_Close"]).replace([np.inf, -np.inf], 0)
-    
-    print("      📏 [模型進度] 特徵縮放與 PCA 降維中...")
-    scaler = StandardScaler()
-    X_scaled_np = scaler.fit_transform(df_aligned_X)
-    df_X_scaled = pd.DataFrame(X_scaled_np, index=df_aligned_X.index, columns=df_aligned_X.columns)
-    
-    n_comp = min(10, len(df_aligned_X.columns))
-    pca = PCA(n_components=n_comp) 
-    X_pca_np = pca.fit_transform(X_scaled_np)
-    df_X_pca = pd.DataFrame(X_pca_np, index=df_aligned_X.index, columns=[f"PC{i+1}" for i in range(pca.n_components_)])
-    
-    merged_for_shift = pd.concat([df_X_scaled, df_X_pca, y_raw], axis=1)
-    model_names = ['PCA_Ridge', 'RandomForest', 'XGBoost']
-    model_preds, model_rmse = {m: {} for m in model_names}, {m: {} for m in model_names} 
-    
-    for window_name, shift_days in WINDOWS.items():
-        print(f"      ⏱️ [訓練進度] ====== 開始訓練【{window_name} ({shift_days}天)】======")
+    # 🔥 核心優化：使用 ProcessPoolExecutor 進行多進程平行運算
+    # max_workers 預設會根據伺服器的 CPU 核心數自動分配
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        # 將工作打包並派發
+        future_to_target = {
+            executor.submit(process_single_target, target_name, df_X_master, series_y): target_name 
+            for target_name, series_y in dict_y_targets.items()
+        }
         
-        y_target = merged_for_shift["Target_Close"].pct_change(shift_days).shift(-shift_days) * 100
-        y_target = y_target.replace([np.inf, -np.inf], np.nan)
-        valid_idx = ~y_target.isna()
-        
-        if valid_idx.sum() < 60:
-            for m in model_names: 
-                model_preds[m][window_name], model_rmse[m][window_name] = "N/A", None
-            continue
-            
-        X_raw_v = merged_for_shift[df_aligned_X.columns].values[valid_idx]
-        X_pca_v = merged_for_shift[[f"PC{i+1}" for i in range(pca.n_components_)]].values[valid_idx]
-        Y_v = y_target[valid_idx].values
-        split_idx = int(len(Y_v) * 0.8)
-        
-        X_latest_raw = merged_for_shift[df_aligned_X.columns].values[-1].reshape(1, -1)
-        X_latest_pca = merged_for_shift[[f"PC{i+1}" for i in range(pca.n_components_)]].values[-1].reshape(1, -1)
-        
-        # 1. PCA_Ridge (使用降維後特徵)
-        ridge = Ridge(alpha=10.0)
-        ridge.fit(X_pca_v[:split_idx], Y_v[:split_idx])
-        model_rmse['PCA_Ridge'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], ridge.predict(X_pca_v[split_idx:]))))
-        model_preds['PCA_Ridge'][window_name] = round(float(ridge.predict(X_latest_pca)[0]), 2)
-        
-        # 2. RandomForest 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心 (使用原始特徵)
-        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-        rf.fit(X_raw_v[:split_idx], Y_v[:split_idx])
-        model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], rf.predict(X_raw_v[split_idx:]))))
-        model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_raw)[0]), 2)
-        
-        # 3. XGBoost 🚀 [極速優化 2] n_jobs=-1 解放所有 CPU 核心 (使用原始特徵)
-        xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror', n_jobs=-1)
-        xgb.fit(X_raw_v[:split_idx], Y_v[:split_idx])
-        model_rmse['XGBoost'][window_name] = float(np.sqrt(mean_squared_error(Y_v[split_idx:], xgb.predict(X_raw_v[split_idx:]))))
-        model_preds['XGBoost'][window_name] = round(float(xgb.predict(X_latest_raw)[0]), 2)
-
-    # 排名統計
-    layers = list(WINDOWS.keys()) + ['Overall']
-    for m in model_names:
-        valid_rmses = [rmse for w, rmse in model_rmse[m].items() if rmse is not None]
-        model_rmse[m]['Overall'] = float(np.mean(valid_rmses)) if valid_rmses else None
-
-    model_ranks = {m: {} for m in model_names}
-    for layer in layers:
-        sorted_models = sorted(model_names, key=lambda m: model_rmse[m].get(layer) if model_rmse[m].get(layer) is not None else 9999.99)
-        for rank, m in enumerate(sorted_models, 1):
-            model_ranks[m][layer] = rank
-
-    results = {}
-    for m in model_names:
-        results[m] = {'Preds': model_preds[m], 'RMSE': model_rmse[m], 'Ranks': model_ranks[m]}
-    return results, df_X_pca
-
-def main():
-    print("="*70)
-    print("🏆 PCA x 機器學習 (V14.5 極速優化版)")
-    print("="*70)
-    
-    try:
-        gc = get_gspread_client()
-        print("\n步驟 1: 尋找並融合三大特徵池 (總經、期貨、AI輿情)...")
-        
-        df_global, df_taifex, df_ai = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        sh_global = find_spreadsheet(gc, "global_market_factors")
-        if sh_global: df_global = load_sheet_as_dataframe(sh_global)
-        
-        sh_taifex = find_spreadsheet(gc, "taifex_derivatives_history")
-        if sh_taifex: df_taifex = load_sheet_as_dataframe(sh_taifex)
-
-        sh_ai = find_spreadsheet(gc, "stock_history_AI_SCORE")
-        if sh_ai: df_ai = load_sheet_as_dataframe(sh_ai)
-
-        print("   🔄 正在將特徵池進行外部合併 (Outer Join)...")
-        df_X_master = df_global.copy()
-        if not df_taifex.empty:
-            df_X_master = df_X_master.join(df_taifex[df_taifex.columns.difference(df_X_master.columns)], how='outer')
-        if not df_ai.empty:
-            df_X_master = df_X_master.join(df_ai[df_ai.columns.difference(df_X_master.columns)], how='outer')
-
-        df_X_master = df_X_master.sort_index().ffill().fillna(0).replace([np.inf, -np.inf], 0)
-        print(f"   🔥 終極特徵矩陣融合完畢！總天數: {len(df_X_master)}")
-
-        print("\n步驟 2: 載入個股歷史資料 (stock_history_13_targets)...")
-        stock_sh = find_spreadsheet(gc, "stock_history_13_targets")
-        if not stock_sh: raise ValueError("找不到個股目標檔案 stock_history_13_targets")
-        df_stocks = load_sheet_as_dataframe(stock_sh)
-
-        print(f"\n🎯 步驟 3: 啟動特徵對齊與模型預測...")
-        today_str, today_dot = datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%Y.%m.%d")
-        first_run_pca, lake_sh_id = None, sh_global.id 
-        
-        # 📝 定義預期輸出的精準表頭順序 (強制約束)
-        header_order = [
-            "Date", "Model_Name", 
-            "Overall_Rank", "Overall_RMSE",
-            "1D_Rank", "1D_RMSE", "1_Day_Pred(%)",
-            "3D_Rank", "3D_RMSE", "3_Days_Pred(%)",
-            "7D_Rank", "7D_RMSE", "7_Days_Pred(%)",
-            "1M_Rank", "1M_RMSE", "1_Month_Pred(%)",
-            "6M_Rank", "6M_RMSE", "6_Months_Pred(%)",
-            "Status", "Update_Time"
-        ]
-        
-        for file_name, file_url in TARGET_SPREADSHEETS.items():
-            if not file_url: # 如果未設定 Google Sheet URL 則跳過
-                continue
-                
-            print(f"\n👉 開始處理新標的: 【{file_name}】")
-            dest_sh = find_spreadsheet(gc, file_name, file_url)
-            if not dest_sh:
-                print(f"   ❌ 找不到寫入表，跳過。")
-                continue
-            
+        # 收集平行運算完畢的結果
+        for future in concurrent.futures.as_completed(future_to_target):
+            target_name = future_to_target[future]
             try:
-                df_X = df_X_master.copy() 
-                target_col = identify_target_column(df_X_master if file_name == "PRE_TWII" else df_stocks, file_name)
-                
-                if not target_col:
-                    msg = f"{today_dot}更新失敗：找不到匹配欄位。"
-                    print(f"   ⚠️ {msg}")
-                    append_error_note(gc, dest_sh.id, "預測紀錄", msg)
-                    continue
-                    
-                s_y = (df_X_master if file_name == "PRE_TWII" else df_stocks)[target_col].copy()
-                result, df_pca_features = predict_with_layered_arena(df_X, s_y)
-                
-                if not result:
-                    append_error_note(gc, dest_sh.id, "預測紀錄", f"{today_dot}更新失敗：有效天數不足。")
-                    continue
-                    
-                if first_run_pca is None: first_run_pca = df_pca_features
-                
-                rows_to_add = []
-                for m in sorted(result.keys(), key=lambda x: result[x]['Ranks'].get('Overall', 99)):
-                    res = result[m]
-                    def get_val(d, k, is_round=True):
-                        v = d.get(k)
-                        return "N/A" if v is None or pd.isna(v) else (round(float(v), 2) if is_round else v)
-                    
-                    rows_to_add.append({
-                        "Date": today_str, "Model_Name": m,
-                        "Overall_Rank": get_val(res['Ranks'], 'Overall', False), "Overall_RMSE": get_val(res['RMSE'], 'Overall'),
-                        "1D_Rank": get_val(res['Ranks'], '1day', False), "1D_RMSE": get_val(res['RMSE'], '1day'), "1_Day_Pred(%)": get_val(res['Preds'], '1day'),
-                        "3D_Rank": get_val(res['Ranks'], '3day', False), "3D_RMSE": get_val(res['RMSE'], '3day'), "3_Days_Pred(%)": get_val(res['Preds'], '3day'),
-                        "7D_Rank": get_val(res['Ranks'], '7day', False), "7D_RMSE": get_val(res['RMSE'], '7day'), "7_Days_Pred(%)": get_val(res['Preds'], '7day'),
-                        "1M_Rank": get_val(res['Ranks'], '1month', False), "1M_RMSE": get_val(res['RMSE'], '1month'), "1_Month_Pred(%)": get_val(res['Preds'], '1month'),
-                        "6M_Rank": get_val(res['Ranks'], '6month', False), "6M_RMSE": get_val(res['RMSE'], '6month'), "6_Months_Pred(%)": get_val(res['Preds'], '6month'),
-                        "Status": "Success", "Update_Time": datetime.now().strftime("%H:%M:%S")
-                    })
-                
-                # 📝 利用 Pandas 強制按照 header_order 排序，配合 clear_update 完全覆寫雲端表頭
-                df_output = pd.DataFrame(rows_to_add)[header_order]
-                safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_output, mode="clear_update")
-                
+                res = future.result()
+                final_results.append(res)
+                print(f"✅ [{target_name}] 計算完成！")
             except Exception as e:
-                msg = f"{today_dot}更新崩潰 ({str(e)})。"
-                print(f"   ⚠️ {msg}")
+                print(f"❌ [{target_name}] 發生嚴重崩潰: {str(e)}")
                 traceback.print_exc()
-                append_error_note(gc, dest_sh.id, "預測紀錄", msg)
 
-        if first_run_pca is not None:
-            print("\n💾 備份全域 PCA 特徵矩陣...")
-            df_pca_output = first_run_pca.reset_index()
-            df_pca_output['Date'] = df_pca_output['Date'].dt.strftime('%Y-%m-%d')
-            safe_gspread_write(gc, lake_sh_id, "global_pca_features", df_pca_output, mode="clear_update")
-            
-        print("\n✅ 所有流程完畢！")
-    except Exception as e:
-        print(f"\n❌ 重大錯誤:\n⚠️ {str(e)}\n")
-        traceback.print_exc()
-        sys.exit(1)
+    # 將結果轉為 DataFrame 方便後續寫入 Google Sheet
+    df_output = pd.DataFrame(final_results)
+    df_output['Update_Time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return df_output
 
+# ==========================================
+# 模擬執行區 (供您參考如何呼叫)
+# ==========================================
 if __name__ == "__main__":
-    main()
+    # 這裡假設您已經從 Google Sheet 抓下了 X (總經) 與 y (個股) 的資料
+    # df_X_master = ... 
+    # dict_y_targets = {'2330.TW': df_2330['Close'], 'NVDA': df_nvda['Close']}
+    
+    # df_final_results = run_pls_pipeline(df_X_master, dict_y_targets)
+    # 接著就可以呼叫您原本的 safe_gspread_write(..., df_final_results, mode="clear_update")
+    pass
