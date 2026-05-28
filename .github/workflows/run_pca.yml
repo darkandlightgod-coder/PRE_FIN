@@ -24,14 +24,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
       - name: 📦 Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --user -r requirements.txt
 
   # 爬蟲工作 (並行執行多個腳本)
   crawler:
@@ -57,12 +57,12 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
 
       - name: 📦 Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --user -r requirements.txt
 
       - name: 🚀 Run Crawler Script
         env:
@@ -91,9 +91,9 @@ jobs:
       - name: 📦 Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --user -r requirements.txt
 
-      - name: 📊 Run Prediction Analysis
+      - name: 📊 Run PCA Analysis
         env:
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
         run: python PCA_TWII.py
