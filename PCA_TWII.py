@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-V14.6.1 PLS_TWII.py (監督式降維 PLS + 多核心平行運算 + 時光機防護版)
-- 修正：修復任務清單收集邏輯，支援僅透過檔名 (file_name) 搜尋目標表格，正確觸發多核心運算。
+V14.6 PLS_TWII.py (監督式降維 PLS + 多核心平行運算 + 時光機防護版)
 - 演算法升級：捨棄無監督的 PCA，改採 PLS 偏最小平方法，降維時強制考慮預測目標 (y)，歐幾里得距離更精準。
-- 防作弊機制：嚴格執行 Train/Test 時間切分，僅用過去資料訓練 PLS 與 XGBoost，杜絕未來數據洩漏。
-- 極速並行：導入 ProcessPoolExecutor，多檔股票同時平行運算，抵銷 PLS 帶來的計算量負擔。
+- 防作弊機制：嚴格執行 Train/Test 時間切分，僅用過去資料訓練 PLS 與模型，杜絕未來數據洩漏。
+- 極速並行：導入 ProcessPoolExecutor，多檔股票同時平行運算。
+- 延續功能：自動表頭對齊覆寫、記憶體防爆、即時日誌追蹤。
 """
 import os
 import sys
@@ -165,6 +165,7 @@ def load_sheet_as_dataframe(sh, worksheet_name=None):
     df.dropna(subset=['Date'], inplace=True)
     df.set_index('Date', inplace=True)
     
+    # 🔥 [防卡死第二道防線] 強制移除重複日期！
     duplicates_count = df.index.duplicated().sum()
     if duplicates_count > 0:
         print(f"      ⚠️ [資料警告] 發現 {duplicates_count} 筆重複日期，已自動清理保留最新一筆！")
@@ -229,20 +230,20 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
         print(f"      ⚙️ [{file_name}] 啟動 PLS 預測引擎...")
         target_col = identify_target_column(df_X_master if file_name == "PRE_TWII" else df_stocks, file_name)
         if not target_col:
-            print(f"      ⚠️ [{file_name}] 找不到目標欄位。")
+            print(f"      ⚠️ [{file_name}] 找不到目標欄位 '{file_name}'。")
             return file_name, None
             
         s_y = (df_X_master if file_name == "PRE_TWII" else df_stocks)[target_col].copy()
         s_y.name = "Target_Close"
         
-        # 對齊資料
+        # 1. 對齊資料
         aligned_data = pd.concat([df_X_master, s_y], axis=1, join='inner').dropna()
         
-        # 🚀 效能優化：過濾 5 年前的過期雜訊，只取近 3 年 (750 個交易日) 進行訓練
+        # 🚀 效能優化：過濾過期雜訊，只取近 3 年 (750 個交易日) 進行訓練
         aligned_data = aligned_data.tail(750)
         
         if len(aligned_data) < 100: 
-            print(f"      ⚠️ [{file_name}] 有效資料不足 100 筆。")
+            print(f"      ⚠️ [{file_name}] 有效資料不足 100 筆，跳過。")
             return file_name, None
         
         y_raw = aligned_data["Target_Close"]
@@ -282,6 +283,7 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
             X_latest_scaled = scaler.transform(X_latest_raw)
             
             # 2. 🎯 核心升級：PLS 監督式降維 🎯
+            # 同時參考 X 與 y_train，針對該標的量身打造特徵
             n_comp = min(10, X_train_scaled.shape[1])
             pls = PLSRegression(n_components=n_comp)
             
@@ -289,7 +291,9 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
             X_test_pls = pls.transform(X_test_scaled)
             X_latest_pls = pls.transform(X_latest_scaled)
             
+            # ===============================================
             # 3. 建立模型 (全面改吃 PLS 量身打造出來的濃縮特徵)
+            # ===============================================
             # (A) PLS_Poly_Ridge
             X_train_pls_poly = poly.fit_transform(X_train_pls)
             X_test_pls_poly = poly.transform(X_test_pls)
@@ -300,13 +304,13 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
             model_rmse['PLS_Poly_Ridge'][window_name] = float(np.sqrt(mean_squared_error(y_test, ridge.predict(X_test_pls_poly))))
             model_preds['PLS_Poly_Ridge'][window_name] = round(float(ridge.predict(X_latest_pls_poly)[0]), 2)
             
-            # (B) RandomForest
+            # (B) RandomForest (內部 n_jobs=1 避免與外部 ProcessPool 衝突)
             rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=1)
             rf.fit(X_train_pls, y_train)
             model_rmse['RandomForest'][window_name] = float(np.sqrt(mean_squared_error(y_test, rf.predict(X_test_pls))))
             model_preds['RandomForest'][window_name] = round(float(rf.predict(X_latest_pls)[0]), 2)
             
-            # (C) XGBoost
+            # (C) XGBoost (內部 n_jobs=1)
             xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42, objective='reg:squarederror', n_jobs=1)
             xgb.fit(X_train_pls, y_train)
             model_rmse['XGBoost'][window_name] = float(np.sqrt(mean_squared_error(y_test, xgb.predict(X_test_pls))))
@@ -336,12 +340,13 @@ def process_single_target(file_name, df_X_master, df_stocks, windows):
         traceback.print_exc()
         return file_name, None
 
+
 # ==========================================
 # 主程式
 # ==========================================
 def main():
     print("="*70)
-    print("🏆 PLS x 機器學習 (V14.6.1 監督式降維 + 多核心平行極速版)")
+    print("🏆 PLS x 機器學習 (V14.6 監督式降維 + 多核心平行極速版)")
     print("="*70)
     
     try:
@@ -370,31 +375,31 @@ def main():
 
         print("\n步驟 2: 載入個股歷史資料 (stock_history_13_targets)...")
         stock_sh = find_spreadsheet(gc, "stock_history_13_targets")
-        if not stock_sh: raise ValueError("找不到個股目標檔案")
+        if not stock_sh: raise ValueError("找不到個股目標檔案 stock_history_13_targets")
         df_stocks = load_sheet_as_dataframe(stock_sh)
 
         print(f"\n🎯 步驟 3: 啟動 PLS 多核心平行運算引擎...")
         today_str, today_dot = datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%Y.%m.%d")
         
-        # 🚀 修正：將 TARGET_SPREADSHEETS 所有的 key (檔名) 列入任務清單，無視 file_url 空字串
+        # 🚀 取出所有檔名作為任務清單 (無視 URL 是否空白)
         tasks = list(TARGET_SPREADSHEETS.keys())
-        print(f"   📋 共獲取 {len(tasks)} 檔標的排隊進入引擎。")
+        print(f"   📋 共獲取 {len(tasks)} 檔標的排隊進入平行運算引擎。")
                 
         results_map = {}
         
-        # 啟動多核心運算 (ProcessPoolExecutor)
+        # 啟動多進程平行運算 (利用所有 CPU 核心)
         with concurrent.futures.ProcessPoolExecutor() as executor:
             futures = []
             for file_name in tasks:
                 futures.append(executor.submit(process_single_target, file_name, df_X_master, df_stocks, WINDOWS))
                 
-            # 收集結果
+            # 收集每一檔股票的回傳結果
             for future in concurrent.futures.as_completed(futures):
                 f_name, res = future.result()
                 if res:
                     results_map[f_name] = res
                     
-        # 📝 步驟 4: 統一寫回 Google Sheets，避免 API 連線衝突
+        # 📝 步驟 4: 統一收集後一次性依序寫回 Google Sheets，避免 API 互相碰撞阻斷
         print("\n步驟 4: 正在統整分析結果，準備同步至雲端...")
         header_order = [
             "Date", "Model_Name", 
@@ -409,39 +414,46 @@ def main():
         
         for file_name, file_url in TARGET_SPREADSHEETS.items():
             if file_name not in results_map:
-                print(f"   ⏭️ [{file_name}] 無預測結果，跳過。")
+                print(f"   ⏭️ [{file_name}] 無預測結果或處理失敗，跳過。")
                 continue
                 
-            print(f"\n👉 尋找並準備寫入: 【{file_name}】")
+            print(f"\n👉 準備更新雲端表單: 【{file_name}】")
             dest_sh = find_spreadsheet(gc, file_name, file_url)
             if not dest_sh:
                 print(f"   ❌ 雲端找不到檔案 '{file_name}'，寫入失敗。")
                 continue
                 
-            result = results_map[file_name]
-            rows_to_add = []
-            
-            for m in sorted(result.keys(), key=lambda x: result[x]['Ranks'].get('Overall', 99)):
-                res = result[m]
-                def get_val(d, k, is_round=True):
-                    v = d.get(k)
-                    return "N/A" if v is None or pd.isna(v) else (round(float(v), 2) if is_round else v)
+            try:
+                result = results_map[file_name]
+                rows_to_add = []
                 
-                rows_to_add.append({
-                    "Date": today_str, "Model_Name": m,
-                    "Overall_Rank": get_val(res['Ranks'], 'Overall', False), "Overall_RMSE": get_val(res['RMSE'], 'Overall'),
-                    "1D_Rank": get_val(res['Ranks'], '1day', False), "1D_RMSE": get_val(res['RMSE'], '1day'), "1_Day_Pred(%)": get_val(res['Preds'], '1day'),
-                    "3D_Rank": get_val(res['Ranks'], '3day', False), "3D_RMSE": get_val(res['RMSE'], '3day'), "3_Days_Pred(%)": get_val(res['Preds'], '3day'),
-                    "7D_Rank": get_val(res['Ranks'], '7day', False), "7D_RMSE": get_val(res['RMSE'], '7day'), "7_Days_Pred(%)": get_val(res['Preds'], '7day'),
-                    "1M_Rank": get_val(res['Ranks'], '1month', False), "1M_RMSE": get_val(res['RMSE'], '1month'), "1_Month_Pred(%)": get_val(res['Preds'], '1month'),
-                    "6M_Rank": get_val(res['Ranks'], '6month', False), "6M_RMSE": get_val(res['RMSE'], '6month'), "6_Months_Pred(%)": get_val(res['Preds'], '6month'),
-                    "Status": "Success", "Update_Time": datetime.now().strftime("%H:%M:%S")
-                })
+                for m in sorted(result.keys(), key=lambda x: result[x]['Ranks'].get('Overall', 99)):
+                    res = result[m]
+                    def get_val(d, k, is_round=True):
+                        v = d.get(k)
+                        return "N/A" if v is None or pd.isna(v) else (round(float(v), 2) if is_round else v)
+                    
+                    rows_to_add.append({
+                        "Date": today_str, "Model_Name": m,
+                        "Overall_Rank": get_val(res['Ranks'], 'Overall', False), "Overall_RMSE": get_val(res['RMSE'], 'Overall'),
+                        "1D_Rank": get_val(res['Ranks'], '1day', False), "1D_RMSE": get_val(res['RMSE'], '1day'), "1_Day_Pred(%)": get_val(res['Preds'], '1day'),
+                        "3D_Rank": get_val(res['Ranks'], '3day', False), "3D_RMSE": get_val(res['RMSE'], '3day'), "3_Days_Pred(%)": get_val(res['Preds'], '3day'),
+                        "7D_Rank": get_val(res['Ranks'], '7day', False), "7D_RMSE": get_val(res['RMSE'], '7day'), "7_Days_Pred(%)": get_val(res['Preds'], '7day'),
+                        "1M_Rank": get_val(res['Ranks'], '1month', False), "1M_RMSE": get_val(res['RMSE'], '1month'), "1_Month_Pred(%)": get_val(res['Preds'], '1month'),
+                        "6M_Rank": get_val(res['Ranks'], '6month', False), "6M_RMSE": get_val(res['RMSE'], '6month'), "6_Months_Pred(%)": get_val(res['Preds'], '6month'),
+                        "Status": "Success", "Update_Time": datetime.now().strftime("%H:%M:%S")
+                    })
+                
+                df_output = pd.DataFrame(rows_to_add)[header_order]
+                safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_output, mode="clear_update")
             
-            df_output = pd.DataFrame(rows_to_add)[header_order]
-            safe_gspread_write(gc, dest_sh.id, "預測紀錄", df_output, mode="clear_update")
+            except Exception as e:
+                msg = f"{today_dot}更新崩潰 ({str(e)})。"
+                print(f"   ⚠️ {msg}")
+                traceback.print_exc()
+                append_error_note(gc, dest_sh.id, "預測紀錄", msg)
             
-        print("\n✅ 所有流程完畢！V14.6.1 系統已登出。")
+        print("\n✅ 所有流程完畢！V14.6 系統已登出。")
         
     except Exception as e:
         print(f"\n❌ 重大錯誤:\n⚠️ {str(e)}\n")
