@@ -3,7 +3,7 @@ name: 🚀 Financial Analysis Pipeline
 on:
   workflow_dispatch: # 手動觸發
   schedule:
-    - cron: '0 9 * * *' # 每天早上 9 點自動執行
+    - cron: '0 5 * * *' # 每天早上 9 點自動執行
 
 jobs:
   # 統一安裝環境與快取
