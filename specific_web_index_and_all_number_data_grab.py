@@ -113,8 +113,24 @@ def main():
     wks = sh.sheet1
     all_values = wks.get_all_values()
     
-    headers = all_values[0]
+# 1. 取得表頭，並強制清除前後隱形空白字元
+    headers = [str(h).strip() for h in all_values[0]]
     df_cloud = pd.DataFrame(all_values[1:], columns=headers)
+    
+    # 2. 智慧尋找與重新命名日期欄位
+    if 'Date' not in df_cloud.columns:
+        if '日期' in df_cloud.columns:
+            df_cloud.rename(columns={'日期': 'Date'}, inplace=True)
+            print("   ⚠️ [自動修復] 偵測到表頭為 '日期'，已自動轉換為 'Date'")
+        elif len(df_cloud.columns) > 0:
+            # 如果連 '日期' 都沒有，直接強硬把「第一欄」當作 Date
+            original_first_col = df_cloud.columns[0]
+            df_cloud.rename(columns={original_first_col: 'Date'}, inplace=True)
+            print(f"   ⚠️ [自動修復] 找不到 Date，已將第一欄 '{original_first_col}' 強制設為 'Date'")
+        else:
+            print("   ❌ [致命錯誤] 雲端表單完全是空的，沒有任何欄位！")
+            return
+            
     df_cloud.set_index('Date', inplace=True)
     
     # 將空白轉為 NaN 以便後續融合
