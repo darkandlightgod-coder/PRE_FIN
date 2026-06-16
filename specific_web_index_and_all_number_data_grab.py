@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-V14.1 光速批次更新器 (Pandas 向量極速版)
+V14.1.1 光速批次更新器 (Pandas 向量極速防呆版)
 優化重點：
 1. 捨棄緩慢的 Python 字典雙重迴圈補值。
 2. 採用 Pandas combine_first 進行矩陣級別的資料融合，速度提升百倍。
 3. 批次下載後直接處理 MultiIndex，完全向量化運算。
+4. 🚀 導入無敵防呆裝甲：自動修復表頭空白、中英文異動，表單全空時自動啟動防護不當機。
 """
 import os
 import json
+import time
 import pandas as pd
 import numpy as np
 import gspread
@@ -36,137 +38,117 @@ def fetch_and_flatten_yf_data(tickers_with_suffix, period):
     df = yf.download(tickers_with_suffix, period=period, threads=True, progress=False)
     if df.empty: return pd.DataFrame()
 
-    # 如果只有一檔股票，yfinance 返回的不是 MultiIndex，需特殊處理
-    if len(tickers_with_suffix) == 1:
-        base = tickers_with_suffix[0].split('.')[0]
-        df = df[['Close', 'Volume']]
-        df.columns = [f"{base}_Close", f"{base}_Volume"]
-    else:
-        # 處理 MultiIndex，將 ('Close', '2330.TW') 轉為 '2330_Close'
-        # 注意：需要把後綴 .TW 或 .TWO 拔掉
-        new_columns = []
+    # 處理 MultiIndex 欄位 (yfinance 新版回傳格式)
+    if isinstance(df.columns, pd.MultiIndex):
+        flat_cols = []
+        valid_cols = []
         for col in df.columns:
-            metric = col[0] # 'Close' 或 'Volume'
-            ticker = col[1] # '2330.TW'
-            if metric in ['Close', 'Volume']:
-                base = ticker.split('.')[0]
-                new_columns.append(f"{base}_{metric}")
-            else:
-                new_columns.append(None)
-                
-        df.columns = new_columns
-        df = df.loc[:, df.columns.notnull()] # 只保留 Close 和 Volume
+            if col[0] in ['Close', 'Volume']:
+                flat_cols.append(f"{col[1]}_{col[0]}")
+                valid_cols.append(col)
+        
+        df = df[valid_cols]
+        df.columns = flat_cols
+    else:
+        # 單一標的時不會是 MultiIndex
+        df = df[['Close', 'Volume']]
+        df.columns = [f"{tickers_with_suffix[0]}_Close", f"{tickers_with_suffix[0]}_Volume"]
 
-    df.index = pd.to_datetime(df.index).strftime("%Y-%m-%d")
-    df.index.name = 'Date'
+    # 確保 Index 是 datetime 且沒有時區
+    df.index = pd.to_datetime(df.index).tz_localize(None)
     return df
 
-def get_bulk_data_as_df(base_tickers, period):
-    """使用超壓縮格式取得資料，並直接返回整理好的 DataFrame"""
-    # 1. 批次 1: 上市 (.TW)
-    tw_tickers = [f"{t}.TW" for t in base_tickers]
-    print(f"   🚀 [批次 1] 同時下載 {len(tw_tickers)} 檔上市 (.TW) 股票...")
-    df_tw = fetch_and_flatten_yf_data(tw_tickers, period)
-
-    # 找出全為 NaN (抓不到資料) 的欄位，推測為上櫃股票
-    failed_bases = []
-    if not df_tw.empty:
-        for base in base_tickers:
-            if f"{base}_Close" not in df_tw.columns or df_tw[f"{base}_Close"].dropna().empty:
-                failed_bases.append(base)
-                # 從 df_tw 中移除無效的欄位
-                if f"{base}_Close" in df_tw.columns: df_tw.drop(columns=[f"{base}_Close", f"{base}_Volume"], inplace=True, errors='ignore')
-
-    # 2. 批次 2: 上櫃 (.TWO)
-    df_two = pd.DataFrame()
-    if failed_bases:
-        two_tickers = [f"{t}.TWO" for t in failed_bases]
-        print(f"   🚀 [批次 2] 偵測到 {len(failed_bases)} 檔查無資料，切換上櫃 (.TWO) 下載...")
-        df_two = fetch_and_flatten_yf_data(two_tickers, period)
-
-    # 3. 合併兩次下載的資料
-    if not df_tw.empty and not df_two.empty:
-        df_new = pd.concat([df_tw, df_two], axis=1)
-    elif not df_tw.empty:
-        df_new = df_tw
-    else:
-        df_new = df_two
-        
-    return df_new
-
 def main():
-    print("===========================================")
-    print(f"⚡ 啟動光速批次更新器 (Pandas 向量極速版)")
-    print("===========================================")
+    print("="*60)
+    print("⚡ 啟動光速批次更新器 (Pandas 向量極速防呆版)")
+    print("="*60)
 
     # ------------------------------------------------
-    # 1. 讀取 Google Sheet (直接轉成 Pandas DataFrame)
+    # 1. 連線 Google Sheet
     # ------------------------------------------------
     print("☁️ 階段一：讀取 Google Sheet 現有資料庫...")
+    creds_json = os.environ.get("GSPREAD_CREDENTIALS")
+    if not creds_json:
+        print("❌ 找不到 GSPREAD_CREDENTIALS 環境變數。")
+        return
+        
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds_json = json.loads(os.environ.get("GSPREAD_CREDENTIALS", "{}"))
-    
-    credentials = Credentials.from_service_account_info(creds_json, scopes=scopes)
+    credentials = Credentials.from_service_account_info(json.loads(creds_json), scopes=scopes)
     gc = gspread.authorize(credentials)
     
-    sh = gc.open(SHEET_NAME)
-    wks = sh.sheet1
-    all_values = wks.get_all_values()
-    
-# 1. 取得表頭，並強制清除前後隱形空白字元
-    headers = [str(h).strip() for h in all_values[0]]
-    df_cloud = pd.DataFrame(all_values[1:], columns=headers)
-    
-    # 2. 智慧尋找與重新命名日期欄位
-    if 'Date' not in df_cloud.columns:
-        if '日期' in df_cloud.columns:
-            df_cloud.rename(columns={'日期': 'Date'}, inplace=True)
-            print("   ⚠️ [自動修復] 偵測到表頭為 '日期'，已自動轉換為 'Date'")
-        elif len(df_cloud.columns) > 0:
-            # 如果連 '日期' 都沒有，直接強硬把「第一欄」當作 Date
-            original_first_col = df_cloud.columns[0]
-            df_cloud.rename(columns={original_first_col: 'Date'}, inplace=True)
-            print(f"   ⚠️ [自動修復] 找不到 Date，已將第一欄 '{original_first_col}' 強制設為 'Date'")
-        else:
-            print("   ❌ [致命錯誤] 雲端表單完全是空的，沒有任何欄位！")
-            return
-            
-    df_cloud.set_index('Date', inplace=True)
-    
-    # 將空白轉為 NaN 以便後續融合
-    df_cloud = df_cloud.replace("", np.nan)
-    
-    # 轉為數值型態
-    for col in df_cloud.columns:
-        df_cloud[col] = pd.to_numeric(df_cloud[col], errors='coerce')
-
-    target_tickers = get_tickers_from_headers(headers)
-    print(f"   ✅ 雲端載入完成，共需更新 {len(target_tickers)} 檔股票。")
-
-    # ------------------------------------------------
-    # 2. 批次下載資料
-    # ------------------------------------------------
-    print(f"\n🕸️ 階段二：光速下載最近 {PERIOD} 資料...")
-    df_new = get_bulk_data_as_df(target_tickers, PERIOD)
-    
-    if df_new.empty:
-        print("   ⚠️ 沒有抓到任何新資料，結束程式。")
+    try:
+        sh = gc.open(SHEET_NAME)
+        worksheet = sh.sheet1
+    except gspread.exceptions.SpreadsheetNotFound:
+        print(f"❌ 找不到試算表 {SHEET_NAME}！")
         return
+
+    # ✅ V14.1.1 強化防呆版：讀取雲端表單
+    all_values = worksheet.get_all_values()
+    headers = []
+    tickers_to_fetch = []
+    
+    # 🛡️ 防護 1：如果表單完全是空的（被清空或初次建立）
+    if not all_values or not all_values[0]:
+        print("   ⚠️ 雲端表單目前為空，系統將跳過歷史讀取，直接建立新資料庫...")
+        df_cloud = pd.DataFrame()
+    else:
+        # 🛡️ 防護 2：清除表頭可能存在的隱形空白字元
+        headers = [str(h).strip() for h in all_values[0]]
+        df_cloud = pd.DataFrame(all_values[1:], columns=headers)
+        
+        # 🛡️ 防護 3：智慧辨識並修復日期欄位
+        if 'Date' not in df_cloud.columns:
+            if '日期' in df_cloud.columns:
+                df_cloud.rename(columns={'日期': 'Date'}, inplace=True)
+                print("   ⚠️ [自動修復] 將 '日期' 轉換為 'Date'")
+            elif len(df_cloud.columns) > 0:
+                original_first_col = df_cloud.columns[0]
+                df_cloud.rename(columns={original_first_col: 'Date'}, inplace=True)
+                print(f"   ⚠️ [自動修復] 強制將第一欄 '{original_first_col}' 設為 'Date'")
+                
+        # 🛡️ 防護 4：確保 Date 轉型成功並設定為 Index
+        if 'Date' in df_cloud.columns:
+            df_cloud['Date'] = pd.to_datetime(df_cloud['Date'], errors='coerce')
+            df_cloud.dropna(subset=['Date'], inplace=True)
+            df_cloud.set_index('Date', inplace=True)
+            
+            # 從整理好的表頭提取要抓的代碼
+            tickers_to_fetch = get_tickers_from_headers(headers)
+        else:
+            print("   ❌ [致命錯誤] 表頭結構完全損毀，視為空表單重新建立。")
+            df_cloud = pd.DataFrame()
+
+    if not df_cloud.empty:
+        df_cloud = df_cloud.replace("", np.nan).apply(pd.to_numeric, errors='coerce')
+
+    # ------------------------------------------------
+    # 2. 爬取最新資料 (Yahoo Finance)
+    # ------------------------------------------------
+    print(f"\n📡 階段二：向 Yahoo Finance 批次請求 {len(tickers_to_fetch)} 檔標的最新資料...")
+    if not tickers_to_fetch:
+        print("   ⚠️ 雲端表單內未偵測到任何有效的標的代號欄位 (如 TX=F_Close)，程式結束。")
+        return
+        
+    df_new = fetch_and_flatten_yf_data(tickers_to_fetch, PERIOD)
+    if df_new.empty:
+        print("   ❌ 無法獲取任何新資料，程式結束。")
+        return
+    print(f"   ✅ 成功下載 {len(df_new)} 筆最新交易日資料。")
 
     # ------------------------------------------------
     # 3. 矩陣融合 (Pandas combine_first 魔法)
     # ------------------------------------------------
     print("\n🧠 階段三：啟動 Pandas 矩陣融合 (補缺漏值)...")
-    # 四捨五入處理
     close_cols = [c for c in df_new.columns if c.endswith("_Close")]
     vol_cols = [c for c in df_new.columns if c.endswith("_Volume")]
     df_new[close_cols] = df_new[close_cols].round(2)
     
-    # combine_first 邏輯：以 df_new 為主，如果 df_new 是 NaN 或缺少的日期/欄位，就用 df_cloud 補上
-    # 這樣完美達成了「更新最新資料」+「保留舊歷史」+「填補空洞」的效果
-    df_final = df_new.combine_first(df_cloud)
-    
-    # 排序日期
+    if not df_cloud.empty:
+        df_final = df_new.combine_first(df_cloud)
+    else:
+        df_final = df_new.copy()
+        
     df_final.sort_index(inplace=True)
 
     # ------------------------------------------------
@@ -174,24 +156,27 @@ def main():
     # ------------------------------------------------
     print("\n🔄 階段四：格式化並整包覆蓋寫回 Google Sheet...")
     df_final.reset_index(inplace=True)
+    df_final['Date'] = df_final['Date'].dt.strftime('%Y-%m-%d')
     
-    # 確保原本的 headers 順序不變，並過濾掉可能多出來的爛欄位
-    df_final = df_final[[col for col in headers if col in df_final.columns]]
+    # 🛡️ 防護 5：確保寫回的表頭順序與原本一致 (如果原本有表頭的話)
+    if headers and 'Date' in headers:
+        ordered_cols = ['Date'] + [col for col in headers if col in df_final.columns and col != 'Date']
+        # 加入新抓到但原本表單沒有的欄位
+        new_cols = [col for col in df_final.columns if col not in ordered_cols]
+        df_final = df_final[ordered_cols + new_cols]
     
     # 格式化輸出
     for col in df_final.columns:
         if col.endswith("_Volume"):
-            df_final[col] = df_final[col].apply(lambda x: str(int(x)) if pd.notna(x) else "")
-        else:
-            df_final[col] = df_final[col].apply(lambda x: str(x) if pd.notna(x) else "")
+            df_final[col] = df_final[col].apply(lambda x: int(x) if pd.notna(x) and str(x).strip() != "" else "")
             
-    df_final.fillna("", inplace=True)
+    df_final = df_final.replace([np.inf, -np.inf], np.nan).fillna("")
     
     output_data = [df_final.columns.tolist()] + df_final.values.tolist()
     
-    wks.clear()
-    wks.update(range_name="A1", values=output_data) 
-    print(f"   🎉 任務完成！Pandas 融合更新結束。")
+    worksheet.clear()
+    worksheet.update(values=output_data, range_name=None)
+    print(f"🎉 更新成功！目前總資料庫共 {len(df_final)} 筆，已全數寫入。")
 
 if __name__ == "__main__":
     main()
