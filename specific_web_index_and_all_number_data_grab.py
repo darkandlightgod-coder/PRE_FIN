@@ -1,4 +1,4 @@
-@@ -1,7 +1,15 @@
+
 # -*- coding: utf-8 -*-
 """
 V14.1 光速批次更新器 (Pandas 向量極速版)
@@ -14,7 +14,7 @@ import numpy as np
 import gspread
 import yfinance as yf
 from google.oauth2.service_account import Credentials
-@@ -10,7 +18,7 @@
+
 # 參數設定區
 # ==========================================
 SHEET_NAME = "taifex_derivatives_history"
@@ -23,7 +23,7 @@ PERIOD = "1mo"  # 每日更新抓近1個月
 
 def get_tickers_from_headers(headers):
     """掃描表頭，提取所有的基礎股票代號 (不含 .TW)"""
-@@ -21,73 +29,78 @@ def get_tickers_from_headers(headers):
+def get_tickers_from_headers(headers):
             tickers.add(ticker)
     return sorted(list(tickers))
 
@@ -155,7 +155,7 @@ def main():
     # ------------------------------------------------
     print("☁️ 階段一：讀取 Google Sheet 現有資料庫...")
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-@@ -101,70 +114,68 @@ def main():
+def main():
     all_values = wks.get_all_values()
 
     headers = all_values[0]
