@@ -98,3 +98,17 @@ jobs:
         env:
           GSPREAD_CREDENTIALS: ${{ secrets.GSPREAD_CREDENTIALS }}
         run: python PCA_TWII.py
+
+  # 🛡️ 保持活躍任務 (避免 GitHub Actions 60 天自動停用)
+  keepalive-job:
+    needs: analysis     # 確保在最後一個分析任務之後才執行
+    runs-on: ubuntu-latest
+    if: always()        # 無論前面的任務成功、失敗或取消，都強制執行此保活動作
+    permissions:
+      contents: write   # 給予寫入權限，以便 Keepalive Action 更新狀態
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: 🛡️ Keepalive Workflow
+        uses: gautamkrishnar/keepalive-workflow@v2
