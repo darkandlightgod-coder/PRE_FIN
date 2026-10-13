@@ -100,22 +100,21 @@ jobs:
         run: python PCA_TWII.py
 
   # 🛡️ 保持活躍任務 (避免 GitHub Actions 60 天自動停用)
-  # 🛡️ 保持活躍任務 (避免 GitHub Actions 60 天自動停用)
-keepalive-job:
-  needs: analysis      # 確保在最後一個分析任務之後才執行
-  runs-on: ubuntu-latest
-  if: always()         # 無論前面的任務成功、失敗或取消，都強制執行此保活動作
-  permissions:
-    contents: write    # 給予寫入權限，以便推送空提交
-  steps:
-    - name: 📥 Checkout Repository
-      uses: actions/checkout@v4
+  keepalive-job:
+    needs: analysis      # 確保在最後一個分析任務之後才執行
+    runs-on: ubuntu-latest
+    if: always()         # 無論前面的任務成功、失敗或取消，都強制執行此保活動作
+    permissions:
+      contents: write    # 給予寫入權限，以便推送空提交
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: 🛡️ Keepalive Dummy Commit
-      run: |
-        git config --global user.name 'github-actions[bot]'
-        git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
-        
-        # 建立一個空提交來更新儲存庫活躍時間，不會新增或修改任何實質檔案
-        git commit --allow-empty -m "chore: keepalive workflow to prevent suspension"
-        git push
+      - name: 🛡️ Keepalive Dummy Commit
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          
+          # 建立一個空提交來更新儲存庫活躍時間，不會新增或修改任何實質檔案
+          git commit --allow-empty -m "chore: keepalive workflow to prevent suspension"
+          git push
